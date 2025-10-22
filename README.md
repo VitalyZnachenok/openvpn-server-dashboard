@@ -195,6 +195,8 @@ Traffic history for chart generation:
 - bytes_in, bytes_out, active_users
 - timestamp
 
+**Important:** The bytes_in and bytes_out values are stored as **delta** (difference from the previous snapshot), not accumulated values. This ensures accurate traffic accounting for each time period. The system correctly handles counter changes when users reconnect.
+
 ## 🔧 Development
 
 ### Local Run (without Docker)

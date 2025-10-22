@@ -2,6 +2,12 @@
 """
 Multi-Server OpenVPN Statistics Collection and Visualization System
 Supports multiple OpenVPN servers and traffic charts
+
+Traffic Accounting Logic:
+- Each snapshot saves DELTA (difference) of traffic since last snapshot
+- This provides accurate traffic consumption per time period
+- Charts display SUM of deltas for each time interval
+- Handles user reconnections gracefully
 """
 
 import os
@@ -215,22 +221,59 @@ class DatabaseManager:
             conn.commit()
     
     def save_traffic_snapshot(self, server_name: str, sessions: List[VPNSession]):
-        """Save traffic snapshot for charts"""
+        """Save traffic snapshot for charts (as delta from previous snapshot)"""
         with sqlite3.connect(self.db_path) as conn:
-            total_in = sum(s.bytes_received for s in sessions)
-            total_out = sum(s.bytes_sent for s in sessions)
+            # Get previous snapshot for delta calculation (accumulated values)
+            prev_snapshot = conn.execute('''
+                SELECT SUM(bytes_in), SUM(bytes_out) FROM (
+                    SELECT bytes_in, bytes_out FROM traffic_history
+                    WHERE server_name = ? AND username IS NOT NULL
+                    AND timestamp = (
+                        SELECT MAX(timestamp) FROM traffic_history 
+                        WHERE server_name = ? AND username IS NOT NULL
+                    )
+                )
+            ''', (server_name, server_name)).fetchone()
+            
+            # Calculate current totals (accumulated)
+            current_total_in = sum(s.bytes_received for s in sessions)
+            current_total_out = sum(s.bytes_sent for s in sessions)
             active_users = len(sessions)
             
+            # Calculate delta (traffic since last snapshot)
+            if prev_snapshot and prev_snapshot[0] is not None:
+                prev_total_in = prev_snapshot[0] or 0
+                prev_total_out = prev_snapshot[1] or 0
+                
+                # Delta represents traffic in this period
+                # Handle reconnections: if current < previous, likely a reconnect
+                if current_total_in >= prev_total_in:
+                    delta_in = current_total_in - prev_total_in
+                else:
+                    # User reconnected, counter reset
+                    delta_in = current_total_in
+                    
+                if current_total_out >= prev_total_out:
+                    delta_out = current_total_out - prev_total_out
+                else:
+                    # User reconnected, counter reset
+                    delta_out = current_total_out
+            else:
+                # First snapshot - use current values as delta
+                delta_in = current_total_in
+                delta_out = current_total_out
+            
+            # Save delta values for server-level aggregate (for charts)
             conn.execute('''
                 INSERT INTO traffic_history (server_name, bytes_in, bytes_out, active_users)
                 VALUES (?, ?, ?, ?)
-            ''', (server_name, total_in, total_out, active_users))
+            ''', (server_name, delta_in, delta_out, active_users))
             
-            # Also save per-user snapshot
+            # Save per-user accumulated values (NOT delta) for future delta calculation
             for session in sessions:
                 conn.execute('''
-                    INSERT INTO traffic_history (server_name, username, bytes_in, bytes_out)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO traffic_history (server_name, username, bytes_in, bytes_out, active_users)
+                    VALUES (?, ?, ?, ?, 0)
                 ''', (server_name, session.username, session.bytes_received, session.bytes_sent))
             
             conn.commit()
@@ -390,12 +433,12 @@ class DatabaseManager:
                 interval_name = 'day'
             
             if server_name:
-                # Single server - use AVG for accumulated bytes
+                # Single server - use SUM for delta bytes
                 query = f'''
                     SELECT 
                         strftime('{interval_format}', timestamp) as time_slot,
-                        AVG(bytes_in) as total_in,
-                        AVG(bytes_out) as total_out,
+                        SUM(bytes_in) as total_in,
+                        SUM(bytes_out) as total_out,
                         AVG(active_users) as users
                     FROM traffic_history
                     WHERE timestamp > ? AND server_name = ? AND username IS NULL
@@ -405,14 +448,14 @@ class DatabaseManager:
                 params = (since, server_name)
             else:
                 # All servers - need to aggregate properly
-                # For each time_slot, get MAX active_users per server, then SUM across servers
+                # For each time_slot, sum delta bytes and average active users
                 query = f'''
                     SELECT 
                         strftime('{interval_format}', timestamp) as time_slot,
                         server_name,
-                        AVG(bytes_in) as total_in,
-                        AVG(bytes_out) as total_out,
-                        MAX(active_users) as users
+                        SUM(bytes_in) as total_in,
+                        SUM(bytes_out) as total_out,
+                        AVG(active_users) as users
                     FROM traffic_history
                     WHERE timestamp > ? AND username IS NULL
                     GROUP BY time_slot, server_name
@@ -431,7 +474,7 @@ class DatabaseManager:
                         aggregated[time_slot] = {'in': 0, 'out': 0, 'users': 0}
                     aggregated[time_slot]['in'] += (row[2] or 0)
                     aggregated[time_slot]['out'] += (row[3] or 0)
-                    aggregated[time_slot]['users'] += (row[4] or 0)  # Sum MAX from each server
+                    aggregated[time_slot]['users'] += (row[4] or 0)
                 
                 # Convert back to rows format
                 rows = [(k, v['in'], v['out'], v['users']) for k, v in sorted(aggregated.items())]
