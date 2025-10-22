@@ -12,26 +12,26 @@ help:
 	@echo "make shell    - Enter container shell"
 
 build:
-	docker-compose build --no-cache
+	docker compose build --no-cache
 
 up:
-	docker-compose up -d
+	docker compose up -d
 
 down:
-	docker-compose down
+	docker compose down
 
 restart:
-	docker-compose restart
+	docker compose restart
 
 logs:
-	docker-compose logs -f
+	docker compose logs -f
 
 clean:
-	docker-compose down -v
+	docker compose down -v
 	rm -rf data/*
 
 shell:
 	docker exec -it openvpn-stats /bin/bash
 
 tail-logs:
-	docker-compose logs -f --tail=100
+	docker compose logs -f --tail=100

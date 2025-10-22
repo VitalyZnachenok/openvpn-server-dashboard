@@ -75,7 +75,7 @@ mkdir -p data
 ```bash
 make up
 # или
-docker-compose up -d
+docker compose up -d
 ```
 
 5. **Откройте в браузере:**
