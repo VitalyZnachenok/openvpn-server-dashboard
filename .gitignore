@@ -1,0 +1,8 @@
+*.pyc
+__pycache__/
+.env.local
+data/*.db
+nginx/.htpasswd
+nginx/ssl/
+*.log
+.DS_Store
