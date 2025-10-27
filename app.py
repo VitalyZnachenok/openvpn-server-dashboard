@@ -137,6 +137,14 @@ class DatabaseManager:
             conn.execute('CREATE INDEX IF NOT EXISTS idx_connected ON sessions(connected_since)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_disconnected ON sessions(disconnected_at)')
             
+            # Create unique index to prevent duplicate active sessions
+            # Only one active session per user/server/connected_since combination
+            conn.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_session 
+                ON sessions(username, server_name, connected_since)
+                WHERE disconnected_at IS NULL
+            ''')
+            
             # Enhanced user stats with server info
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS user_stats (
@@ -663,19 +671,25 @@ class MultiServerStatsCollector:
                 
                 # Get active sessions from DB
                 db_active_sessions = self.db.get_active_sessions(server_name)
-                db_active_users = {s['username']: s for s in db_active_sessions}
                 
-                # Update DB with new data
-                current_users = set()
+                # Create set of current session keys (username + connected_since)
+                current_session_keys = set()
                 for session in sessions:
+                    key = (session.username, session.connected_since)
+                    current_session_keys.add(key)
                     self.db.save_session(session)
                     self.db.update_user_stats(session.username, server_name)
-                    current_users.add(session.username)
                 
-                # Mark disconnected sessions
+                # Mark disconnected sessions - check by username AND connected_since
                 disconnected_count = 0
-                for username, db_session in db_active_users.items():
-                    if username not in current_users:
+                for db_session in db_active_sessions:
+                    db_key = (
+                        db_session['username'],
+                        datetime.fromisoformat(db_session['connected_since'])
+                    )
+                    
+                    if db_key not in current_session_keys:
+                        # This specific session is no longer active
                         disconnected_session = VPNSession(
                             username=db_session['username'],
                             real_address=db_session['real_address'],
@@ -687,7 +701,7 @@ class MultiServerStatsCollector:
                             disconnected_at=datetime.now()
                         )
                         self.db.save_session(disconnected_session)
-                        self.db.update_user_stats(username, server_name)
+                        self.db.update_user_stats(db_session['username'], server_name)
                         disconnected_count += 1
                 
                 logger.info(f"[{server_name}] Updated: {len(sessions)} active, {disconnected_count} disconnected")
