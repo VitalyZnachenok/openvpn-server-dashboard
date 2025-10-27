@@ -264,6 +264,30 @@
         th {
             background: var(--hover-bg);
             font-weight: 600;
+            cursor: pointer;
+            user-select: none;
+            position: relative;
+            padding-right: 25px;
+        }
+        th:hover {
+            background: var(--input-border);
+        }
+        th.sortable::after {
+            content: '⇅';
+            position: absolute;
+            right: 8px;
+            opacity: 0.3;
+            font-size: 0.9em;
+        }
+        th.sort-asc::after {
+            content: '↑';
+            opacity: 1;
+            color: var(--stat-color);
+        }
+        th.sort-desc::after {
+            content: '↓';
+            opacity: 1;
+            color: var(--stat-color);
         }
         /* Highlight session columns */
         table tbody tr td:nth-child(4),
@@ -415,6 +439,11 @@
         let totalUsers = 0;
         let searchQuery = '';
         let allUserStats = [];
+        let allActiveSessions = [];
+        
+        // Sorting state
+        let sessionSort = { column: null, direction: 'asc' };
+        let userSort = { column: null, direction: 'asc' };
         
         // Theme management
         function toggleTheme() {
@@ -599,6 +628,78 @@
             window.location.href = url;
         }
         
+        // Sorting functions
+        function sortSessions(column) {
+            if (sessionSort.column === column) {
+                sessionSort.direction = sessionSort.direction === 'asc' ? 'desc' : 'asc';
+            } else {
+                sessionSort.column = column;
+                sessionSort.direction = 'asc';
+            }
+            renderActiveSessions();
+        }
+        
+        function sortUsers(column) {
+            if (userSort.column === column) {
+                userSort.direction = userSort.direction === 'asc' ? 'desc' : 'asc';
+            } else {
+                userSort.column = column;
+                userSort.direction = 'asc';
+            }
+            renderUserStats();
+        }
+        
+        function getSortValue(item, column) {
+            // Handle different data types for sorting
+            switch(column) {
+                case 'duration':
+                    // Convert HH:MM:SS to seconds for sorting
+                    const parts = item.duration.split(':');
+                    return parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseInt(parts[2]);
+                case 'total_time':
+                    // Convert "XXh YYm" to minutes for sorting
+                    const timeStr = item.total_time || '0h 0m';
+                    const hours = parseInt(timeStr.match(/(\d+)h/)?.[1] || 0);
+                    const minutes = parseInt(timeStr.match(/(\d+)m/)?.[1] || 0);
+                    return hours * 60 + minutes;
+                case 'traffic':
+                    return item.bytes_received + item.bytes_sent;
+                case 'download':
+                    return item.bytes_received || item.download_gb || 0;
+                case 'upload':
+                    return item.bytes_sent || item.upload_gb || 0;
+                case 'last_seen':
+                    return new Date(item.last_seen).getTime();
+                case 'status':
+                    return item.status === 'online' ? 1 : 0;
+                case 'total_sessions':
+                case 'sessions_today':
+                case 'sessions_week':
+                    return parseInt(item[column]) || 0;
+                default:
+                    return item[column] || '';
+            }
+        }
+        
+        function sortData(data, sortState) {
+            if (!sortState.column) return data;
+            
+            return [...data].sort((a, b) => {
+                const aVal = getSortValue(a, sortState.column);
+                const bVal = getSortValue(b, sortState.column);
+                
+                if (typeof aVal === 'string') {
+                    return sortState.direction === 'asc' 
+                        ? aVal.localeCompare(bVal)
+                        : bVal.localeCompare(aVal);
+                } else {
+                    return sortState.direction === 'asc'
+                        ? aVal - bVal
+                        : bVal - aVal;
+                }
+            });
+        }
+        
         // Search users
         function searchUsers() {
             searchQuery = $('#userSearch').val();
@@ -625,6 +726,111 @@
             $('#userPagination').html(html);
         }
         
+        // Render active sessions with sorting
+        function renderActiveSessions() {
+            const sortedData = sortData(allActiveSessions, sessionSort);
+            
+            if (sortedData.length > 0) {
+                const getSortClass = (column) => {
+                    if (sessionSort.column === column) {
+                        return sessionSort.direction === 'asc' ? 'sort-asc' : 'sort-desc';
+                    }
+                    return 'sortable';
+                };
+                
+                let tableHtml = '<table><thead><tr>' +
+                    `<th class="${getSortClass('username')}" onclick="sortSessions('username')">Username</th>` +
+                    `<th class="${getSortClass('server_name')}" onclick="sortSessions('server_name')">Server</th>` +
+                    `<th class="${getSortClass('real_address')}" onclick="sortSessions('real_address')">Real IP</th>` +
+                    `<th class="${getSortClass('virtual_address')}" onclick="sortSessions('virtual_address')">Virtual IP</th>` +
+                    `<th class="${getSortClass('duration')}" onclick="sortSessions('duration')">Duration</th>` +
+                    `<th class="${getSortClass('traffic')}" onclick="sortSessions('traffic')">Traffic</th>` +
+                    '</tr></thead><tbody>';
+                
+                sortedData.forEach(session => {
+                    tableHtml += '<tr>' +
+                        '<td><strong>' + session.username + '</strong></td>' +
+                        '<td><span class="server-badge">' + session.server_name + '</span></td>' +
+                        '<td>' + session.real_address + '</td>' +
+                        '<td>' + session.virtual_address + '</td>' +
+                        '<td>' + session.duration + '</td>' +
+                        '<td>' +
+                            '<div class="traffic-indicator">' +
+                            '<span class="arrow-down">↓</span>' + session.download_mb + ' MB ' +
+                            '<span class="arrow-up">↑</span>' + session.upload_mb + ' MB' +
+                            '</div>' +
+                        '</td>' +
+                        '</tr>';
+                });
+                
+                tableHtml += '</tbody></table>';
+                $('#activeSessionsTable').html(tableHtml);
+            } else {
+                $('#activeSessionsTable').html('<p style="text-align: center; color: #999;">No active sessions</p>');
+            }
+        }
+        
+        // Render user stats with sorting
+        function renderUserStats() {
+            const sortedData = sortData(allUserStats, userSort);
+            
+            if (sortedData.length > 0) {
+                const getSortClass = (column) => {
+                    if (userSort.column === column) {
+                        return userSort.direction === 'asc' ? 'sort-asc' : 'sort-desc';
+                    }
+                    return 'sortable';
+                };
+                
+                let tableHtml = '<table><thead><tr>' +
+                    `<th class="${getSortClass('username')}" onclick="sortUsers('username')">Username</th>`;
+                
+                if (!currentServer) {
+                    tableHtml += `<th class="${getSortClass('servers')}" onclick="sortUsers('servers')">Servers</th>`;
+                }
+                
+                tableHtml += `<th class="${getSortClass('status')}" onclick="sortUsers('status')">Status</th>` +
+                    `<th class="${getSortClass('sessions_today')}" onclick="sortUsers('sessions_today')">Today</th>` +
+                    `<th class="${getSortClass('sessions_week')}" onclick="sortUsers('sessions_week')">Week</th>` +
+                    `<th class="${getSortClass('total_sessions')}" onclick="sortUsers('total_sessions')">All Time</th>` +
+                    `<th class="${getSortClass('total_time')}" onclick="sortUsers('total_time')">Total Time</th>` +
+                    `<th class="${getSortClass('download')}" onclick="sortUsers('download')">Download</th>` +
+                    `<th class="${getSortClass('upload')}" onclick="sortUsers('upload')">Upload</th>` +
+                    `<th class="${getSortClass('last_seen')}" onclick="sortUsers('last_seen')">Last Seen</th>` +
+                    '</tr></thead><tbody>';
+                
+                sortedData.forEach(user => {
+                    const statusClass = user.status === 'online' ? 'status-online' : 'status-offline';
+                    const lastSeen = new Date(user.last_seen).toLocaleString();
+                    
+                    tableHtml += '<tr>' +
+                        '<td><strong>' + user.username + '</strong></td>';
+                    
+                    if (!currentServer && user.servers) {
+                        const servers = user.servers.split(',').map(s => 
+                            `<span class="server-badge">${s}</span>`
+                        ).join(' ');
+                        tableHtml += '<td>' + servers + '</td>';
+                    }
+                    
+                    tableHtml += '<td><span class="' + statusClass + '">' + user.status + '</span></td>' +
+                        '<td><strong>' + (user.sessions_today || 0) + '</strong></td>' +
+                        '<td><strong>' + (user.sessions_week || 0) + '</strong></td>' +
+                        '<td><strong>' + user.total_sessions + '</strong></td>' +
+                        '<td>' + user.total_time + '</td>' +
+                        '<td class="arrow-down">↓ ' + user.download_gb + ' GB</td>' +
+                        '<td class="arrow-up">↑ ' + user.upload_gb + ' GB</td>' +
+                        '<td>' + lastSeen + '</td>' +
+                        '</tr>';
+                });
+                
+                tableHtml += '</tbody></table>';
+                $('#userStatsTable').html(tableHtml);
+            } else {
+                $('#userStatsTable').html('<p style="text-align: center; color: #999;">No user statistics available</p>');
+            }
+        }
+        
         // Update dashboard
         function updateDashboard() {
             const params = currentServer ? `?server=${currentServer}` : '';
@@ -639,37 +845,8 @@
             
             // Update active sessions
             $.get('/api/active_sessions' + params, function(data) {
-                if (data.length > 0) {
-                    let tableHtml = '<table><thead><tr>' +
-                        '<th>Username</th>' +
-                        '<th>Server</th>' +
-                        '<th>Real IP</th>' +
-                        '<th>Virtual IP</th>' +
-                        '<th>Duration</th>' +
-                        '<th>Traffic</th>' +
-                        '</tr></thead><tbody>';
-                    
-                    data.forEach(session => {
-                        tableHtml += '<tr>' +
-                            '<td><strong>' + session.username + '</strong></td>' +
-                            '<td><span class="server-badge">' + session.server_name + '</span></td>' +
-                            '<td>' + session.real_address + '</td>' +
-                            '<td>' + session.virtual_address + '</td>' +
-                            '<td>' + session.duration + '</td>' +
-                            '<td>' +
-                                '<div class="traffic-indicator">' +
-                                '<span class="arrow-down">↓</span>' + session.download_mb + ' MB ' +
-                                '<span class="arrow-up">↑</span>' + session.upload_mb + ' MB' +
-                                '</div>' +
-                            '</td>' +
-                            '</tr>';
-                    });
-                    
-                    tableHtml += '</tbody></table>';
-                    $('#activeSessionsTable').html(tableHtml);
-                } else {
-                    $('#activeSessionsTable').html('<p style="text-align: center; color: #999;">No active sessions</p>');
-                }
+                allActiveSessions = data;
+                renderActiveSessions();
             });
             
             // Update user stats
@@ -691,52 +868,9 @@
             $.get('/api/user_stats' + params + searchParam, function(response) {
                 const data = response.data || response;
                 totalUsers = response.total || data.length;
+                allUserStats = data;
                 
-                if (data.length > 0) {
-                    let tableHtml = '<table><thead><tr>' +
-                        '<th>Username</th>' +
-                        (currentServer ? '' : '<th>Servers</th>') +
-                        '<th>Status</th>' +
-                        '<th>Today</th>' +
-                        '<th>Week</th>' +
-                        '<th>All Time</th>' +
-                        '<th>Total Time</th>' +
-                        '<th>Download</th>' +
-                        '<th>Upload</th>' +
-                        '<th>Last Seen</th>' +
-                        '</tr></thead><tbody>';
-                    
-                    data.forEach(user => {
-                        const statusClass = user.status === 'online' ? 'status-online' : 'status-offline';
-                        const lastSeen = new Date(user.last_seen).toLocaleString();
-                        
-                        tableHtml += '<tr>' +
-                            '<td><strong>' + user.username + '</strong></td>';
-                        
-                        if (!currentServer && user.servers) {
-                            const servers = user.servers.split(',').map(s => 
-                                `<span class="server-badge">${s}</span>`
-                            ).join(' ');
-                            tableHtml += '<td>' + servers + '</td>';
-                        }
-                        
-                        tableHtml += '<td><span class="' + statusClass + '">' + user.status + '</span></td>' +
-                            '<td><strong>' + (user.sessions_today || 0) + '</strong></td>' +
-                            '<td><strong>' + (user.sessions_week || 0) + '</strong></td>' +
-                            '<td><strong>' + user.total_sessions + '</strong></td>' +
-                            '<td>' + user.total_time + '</td>' +
-                            '<td class="arrow-down">↓ ' + user.download_gb + ' GB</td>' +
-                            '<td class="arrow-up">↑ ' + user.upload_gb + ' GB</td>' +
-                            '<td>' + lastSeen + '</td>' +
-                            '</tr>';
-                    });
-                    
-                    tableHtml += '</tbody></table>';
-                    $('#userStatsTable').html(tableHtml);
-                } else {
-                    $('#userStatsTable').html('<p style="text-align: center; color: #999;">No user statistics available</p>');
-                }
-                
+                renderUserStats();
                 renderPagination();
             });
         }
@@ -752,6 +886,9 @@
             $('#serverSelect').change(function() {
                 currentServer = $(this).val();
                 currentPage = 0;
+                // Reset sorting when changing servers
+                sessionSort = { column: null, direction: 'asc' };
+                userSort = { column: null, direction: 'asc' };
                 updateDashboard();
             });
             

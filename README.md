@@ -29,6 +29,7 @@ The dashboard provides:
 - Traffic charts for different periods (5 min, 30 min, 1 hour, 6 hours, 24 hours, week)
 - Active session table with connection details
 - User statistics with filtering and search
+- **Sortable columns** - click on any column header to sort ascending/descending
 
 ## 🚀 Quick Start
 
