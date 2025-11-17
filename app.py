@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
 Multi-Server OpenVPN Statistics Collection and Visualization System
-Supports multiple OpenVPN servers and traffic charts
-
-Traffic Accounting Logic:
-- Each snapshot saves DELTA (difference) of traffic since last snapshot
-- This provides accurate traffic consumption per time period
-- Charts display SUM of deltas for each time interval
-- Handles user reconnections gracefully
+Supports multiple servers, multiple simultaneous sessions per user, and traffic charts.
 """
 
 import os
@@ -229,60 +223,83 @@ class DatabaseManager:
             conn.commit()
     
     def save_traffic_snapshot(self, server_name: str, sessions: List[VPNSession]):
-        """Save traffic snapshot for charts (as delta from previous snapshot)"""
+        """Save traffic snapshot for charts (delta from previous snapshot)"""
         with sqlite3.connect(self.db_path) as conn:
-            # Get previous snapshot for delta calculation (accumulated values)
-            prev_snapshot = conn.execute('''
-                SELECT SUM(bytes_in), SUM(bytes_out) FROM (
-                    SELECT bytes_in, bytes_out FROM traffic_history
-                    WHERE server_name = ? AND username IS NOT NULL
-                    AND timestamp = (
-                        SELECT MAX(timestamp) FROM traffic_history 
-                        WHERE server_name = ? AND username IS NOT NULL
-                    )
-                )
-            ''', (server_name, server_name)).fetchone()
+            prev_sessions = {}
             
-            # Calculate current totals (accumulated)
-            current_total_in = sum(s.bytes_received for s in sessions)
-            current_total_out = sum(s.bytes_sent for s in sessions)
-            active_users = len(sessions)
+            # Fetch previous session states
+            last_timestamp_query = conn.execute('''
+                SELECT MAX(timestamp) FROM traffic_history 
+                WHERE server_name = ? AND username IS NOT NULL
+            ''', (server_name,)).fetchone()
             
-            # Calculate delta (traffic since last snapshot)
-            if prev_snapshot and prev_snapshot[0] is not None:
-                prev_total_in = prev_snapshot[0] or 0
-                prev_total_out = prev_snapshot[1] or 0
+            if last_timestamp_query and last_timestamp_query[0]:
+                last_timestamp = last_timestamp_query[0]
+                prev_data = conn.execute('''
+                    SELECT username, bytes_in, bytes_out, timestamp
+                    FROM traffic_history
+                    WHERE server_name = ? AND username IS NOT NULL AND timestamp = ?
+                ''', (server_name, last_timestamp)).fetchall()
                 
-                # Delta represents traffic in this period
-                # Handle reconnections: if current < previous, likely a reconnect
-                if current_total_in >= prev_total_in:
-                    delta_in = current_total_in - prev_total_in
-                else:
-                    # User reconnected, counter reset
-                    delta_in = current_total_in
-                    
-                if current_total_out >= prev_total_out:
-                    delta_out = current_total_out - prev_total_out
-                else:
-                    # User reconnected, counter reset
-                    delta_out = current_total_out
-            else:
-                # First snapshot - use current values as delta
-                delta_in = current_total_in
-                delta_out = current_total_out
+                for row in prev_data:
+                    username = row[0]
+                    if username not in prev_sessions:
+                        prev_sessions[username] = []
+                    prev_sessions[username].append({
+                        'bytes_in': row[1],
+                        'bytes_out': row[2]
+                    })
             
-            # Save delta values for server-level aggregate (for charts)
+            total_delta_in = 0
+            total_delta_out = 0
+            active_users = len(set(s.username for s in sessions))
+            
+            current_sessions_by_user = {}
+            for session in sessions:
+                if session.username not in current_sessions_by_user:
+                    current_sessions_by_user[session.username] = []
+                current_sessions_by_user[session.username].append(session)
+            
+            for username, user_sessions in current_sessions_by_user.items():
+                prev_user_sessions = prev_sessions.get(username, [])
+                
+                current_user_in = sum(s.bytes_received for s in user_sessions)
+                current_user_out = sum(s.bytes_sent for s in user_sessions)
+                
+                prev_user_in = sum(p['bytes_in'] for p in prev_user_sessions)
+                prev_user_out = sum(p['bytes_out'] for p in prev_user_sessions)
+                
+                if prev_user_sessions:
+                    if current_user_in >= prev_user_in:
+                        user_delta_in = current_user_in - prev_user_in
+                    else:
+                        user_delta_in = current_user_in
+                        logger.info(f"[{server_name}] Counter reset: {username} (IN: {prev_user_in} -> {current_user_in})")
+                    
+                    if current_user_out >= prev_user_out:
+                        user_delta_out = current_user_out - prev_user_out
+                    else:
+                        user_delta_out = current_user_out
+                        logger.info(f"[{server_name}] Counter reset: {username} (OUT: {prev_user_out} -> {current_user_out})")
+                else:
+                    user_delta_in = current_user_in
+                    user_delta_out = current_user_out
+                
+                total_delta_in += user_delta_in
+                total_delta_out += user_delta_out
+                
+                for session in user_sessions:
+                    conn.execute('''
+                        INSERT INTO traffic_history (server_name, username, bytes_in, bytes_out, active_users)
+                        VALUES (?, ?, ?, ?, 0)
+                    ''', (server_name, session.username, session.bytes_received, session.bytes_sent))
+            
             conn.execute('''
                 INSERT INTO traffic_history (server_name, bytes_in, bytes_out, active_users)
                 VALUES (?, ?, ?, ?)
-            ''', (server_name, delta_in, delta_out, active_users))
+            ''', (server_name, total_delta_in, total_delta_out, active_users))
             
-            # Save per-user accumulated values (NOT delta) for future delta calculation
-            for session in sessions:
-                conn.execute('''
-                    INSERT INTO traffic_history (server_name, username, bytes_in, bytes_out, active_users)
-                    VALUES (?, ?, ?, ?, 0)
-                ''', (server_name, session.username, session.bytes_received, session.bytes_sent))
+            logger.debug(f"[{server_name}] Traffic snapshot: Δ{total_delta_in/(1024**2):.2f}MB in, Δ{total_delta_out/(1024**2):.2f}MB out, {active_users} unique users")
             
             conn.commit()
     
@@ -426,28 +443,26 @@ class DatabaseManager:
         with sqlite3.connect(self.db_path) as conn:
             since = datetime.now() - timedelta(hours=hours)
             
-            # Determine aggregation interval based on time range
-            if hours <= 0.5:  # 30 minutes
+            if hours <= 0.5:
                 interval_format = '%Y-%m-%d %H:%M'
                 interval_name = 'minute'
             elif hours <= 6:
-                interval_format = '%Y-%m-%d %H:%M'  # Every minute for short periods
+                interval_format = '%Y-%m-%d %H:%M'
                 interval_name = 'minute'
             elif hours <= 24:
-                interval_format = '%Y-%m-%d %H:00'  # Every hour for day view
+                interval_format = '%Y-%m-%d %H:00'
                 interval_name = 'hour'
             else:
-                interval_format = '%Y-%m-%d'  # Daily for longer periods
+                interval_format = '%Y-%m-%d'
                 interval_name = 'day'
             
             if server_name:
-                # Single server - use SUM for delta bytes
                 query = f'''
                     SELECT 
                         strftime('{interval_format}', timestamp) as time_slot,
                         SUM(bytes_in) as total_in,
                         SUM(bytes_out) as total_out,
-                        AVG(active_users) as users
+                        MAX(active_users) as users
                     FROM traffic_history
                     WHERE timestamp > ? AND server_name = ? AND username IS NULL
                     GROUP BY time_slot
@@ -455,15 +470,13 @@ class DatabaseManager:
                 '''
                 params = (since, server_name)
             else:
-                # All servers - need to aggregate properly
-                # For each time_slot, sum delta bytes and average active users
                 query = f'''
                     SELECT 
                         strftime('{interval_format}', timestamp) as time_slot,
                         server_name,
                         SUM(bytes_in) as total_in,
                         SUM(bytes_out) as total_out,
-                        AVG(active_users) as users
+                        MAX(active_users) as users
                     FROM traffic_history
                     WHERE timestamp > ? AND username IS NULL
                     GROUP BY time_slot, server_name
@@ -471,10 +484,8 @@ class DatabaseManager:
                 '''
                 params = (since,)
                 
-                # Execute and aggregate results
                 rows_raw = conn.execute(query, params).fetchall()
                 
-                # Group by time_slot and sum across servers
                 aggregated = {}
                 for row in rows_raw:
                     time_slot = row[0]
@@ -484,35 +495,30 @@ class DatabaseManager:
                     aggregated[time_slot]['out'] += (row[3] or 0)
                     aggregated[time_slot]['users'] += (row[4] or 0)
                 
-                # Convert back to rows format
                 rows = [(k, v['in'], v['out'], v['users']) for k, v in sorted(aggregated.items())]
             
             if server_name:
                 rows = conn.execute(query, params).fetchall()
             
-            # Format labels for better display
             labels = []
             for row in rows:
                 time_str = row[0]
                 if not time_str:
                     continue
                 if interval_name == 'hour':
-                    # Format as "14:00" for hourly
                     labels.append(time_str.split(' ')[1] if ' ' in time_str else time_str)
                 elif interval_name == 'minute':
-                    # Format as "14:30" for minutes
                     labels.append(time_str.split(' ')[1] if ' ' in time_str else time_str)
                 else:
-                    # Format as "Jan 15" for daily
                     labels.append(time_str)
             
             logger.debug(f"Traffic history: {len(rows)} data points, server={server_name}, hours={hours}")
             
             return {
                 'labels': labels,
-                'inbound': [row[1] / (1024**3) if row[1] else 0 for row in rows],  # Convert to GB
+                'inbound': [row[1] / (1024**3) if row[1] else 0 for row in rows],
                 'outbound': [row[2] / (1024**3) if row[2] else 0 for row in rows],
-                'users': [int(row[3]) if row[3] else 0 for row in rows]  # Ensure integers for user count
+                'users': [int(row[3]) if row[3] else 0 for row in rows]
             }
     
     def cleanup_old_data(self):
