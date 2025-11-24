@@ -73,6 +73,7 @@ if not SERVERS:
 class VPNSession:
     username: str
     real_address: str
+    real_address_port: str
     virtual_address: str
     bytes_received: int
     bytes_sent: int
@@ -116,6 +117,7 @@ class DatabaseManager:
                     username TEXT NOT NULL,
                     server_name TEXT NOT NULL,
                     real_address TEXT NOT NULL,
+                    real_address_port TEXT NOT NULL,
                     virtual_address TEXT,
                     bytes_received INTEGER DEFAULT 0,
                     bytes_sent INTEGER DEFAULT 0,
@@ -126,16 +128,30 @@ class DatabaseManager:
                 )
             ''')
             
+            # Add real_address_port column if it doesn't exist (migration for existing databases)
+            try:
+                conn.execute('ALTER TABLE sessions ADD COLUMN real_address_port TEXT')
+                logger.info("Added real_address_port column to sessions table")
+            except sqlite3.OperationalError:
+                # Column already exists
+                pass
+            
             conn.execute('CREATE INDEX IF NOT EXISTS idx_username ON sessions(username)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_server ON sessions(server_name)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_connected ON sessions(connected_since)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_disconnected ON sessions(disconnected_at)')
             
+            # Drop old unique index if exists
+            try:
+                conn.execute('DROP INDEX IF EXISTS idx_unique_active_session')
+            except sqlite3.OperationalError:
+                pass
+            
             # Create unique index to prevent duplicate active sessions
-            # Only one active session per user/server/connected_since combination
+            # Unique key: username + server + real_address + port (allows multiple sessions from same user on different devices/ports)
             conn.execute('''
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_session 
-                ON sessions(username, server_name, connected_since)
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_session_v2
+                ON sessions(username, server_name, real_address, real_address_port)
                 WHERE disconnected_at IS NULL
             ''')
             
@@ -176,11 +192,12 @@ class DatabaseManager:
     
     def save_session(self, session: VPNSession):
         with sqlite3.connect(self.db_path) as conn:
-            # Check existing session
+            # Check existing session by unique key (username, server, real_address, port)
             existing = conn.execute('''
                 SELECT id FROM sessions 
-                WHERE username = ? AND server_name = ? AND connected_since = ?
-            ''', (session.username, session.server_name, session.connected_since)).fetchone()
+                WHERE username = ? AND server_name = ? AND real_address = ? AND real_address_port = ?
+                AND disconnected_at IS NULL
+            ''', (session.username, session.server_name, session.real_address, session.real_address_port)).fetchone()
             
             if existing:
                 # Update existing session
@@ -204,14 +221,15 @@ class DatabaseManager:
                 # Insert new session
                 conn.execute('''
                     INSERT INTO sessions (
-                        username, server_name, real_address, virtual_address,
+                        username, server_name, real_address, real_address_port, virtual_address,
                         bytes_received, bytes_sent, connected_since,
                         disconnected_at, session_duration
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     session.username,
                     session.server_name,
                     session.real_address,
+                    session.real_address_port,
                     session.virtual_address,
                     session.bytes_received,
                     session.bytes_sent,
@@ -583,7 +601,14 @@ class OpenVPNParser:
                         if len(parts) >= 8:
                             username = parts[1]
                             real_address_with_port = parts[2]
-                            real_address = real_address_with_port.split(':')[0]
+                            
+                            # Extract IP and port separately
+                            if ':' in real_address_with_port:
+                                real_address, real_address_port = real_address_with_port.rsplit(':', 1)
+                            else:
+                                real_address = real_address_with_port
+                                real_address_port = 'unknown'
+                            
                             virtual_address = parts[3] if len(parts) > 3 and parts[3] else None
                             
                             try:
@@ -605,6 +630,7 @@ class OpenVPNParser:
                             session = VPNSession(
                                 username=username,
                                 real_address=real_address,
+                                real_address_port=real_address_port,
                                 virtual_address=virtual_address,
                                 bytes_received=bytes_received,
                                 bytes_sent=bytes_sent,
@@ -678,20 +704,21 @@ class MultiServerStatsCollector:
                 # Get active sessions from DB
                 db_active_sessions = self.db.get_active_sessions(server_name)
                 
-                # Create set of current session keys (username + connected_since)
+                # Create set of current session keys (username + real_address + port)
                 current_session_keys = set()
                 for session in sessions:
-                    key = (session.username, session.connected_since)
+                    key = (session.username, session.real_address, session.real_address_port)
                     current_session_keys.add(key)
                     self.db.save_session(session)
                     self.db.update_user_stats(session.username, server_name)
                 
-                # Mark disconnected sessions - check by username AND connected_since
+                # Mark disconnected sessions - check by username + real_address + port
                 disconnected_count = 0
                 for db_session in db_active_sessions:
                     db_key = (
                         db_session['username'],
-                        datetime.fromisoformat(db_session['connected_since'])
+                        db_session['real_address'],
+                        db_session.get('real_address_port', 'unknown')
                     )
                     
                     if db_key not in current_session_keys:
@@ -699,6 +726,7 @@ class MultiServerStatsCollector:
                         disconnected_session = VPNSession(
                             username=db_session['username'],
                             real_address=db_session['real_address'],
+                            real_address_port=db_session.get('real_address_port', 'unknown'),
                             virtual_address=db_session['virtual_address'],
                             bytes_received=db_session['bytes_received'],
                             bytes_sent=db_session['bytes_sent'],
@@ -774,10 +802,14 @@ def api_active_sessions():
         total_bytes = s['bytes_received'] + s['bytes_sent']
         traffic_mb = round(total_bytes / (1024**2), 2)
         
+        # Format real address with port
+        real_addr_port = s.get('real_address_port', 'unknown')
+        real_address_display = f"{s['real_address']}:{real_addr_port}" if real_addr_port != 'unknown' else s['real_address']
+        
         formatted_sessions.append({
             'username': s['username'],
             'server_name': s['server_name'],
-            'real_address': s['real_address'],
+            'real_address': real_address_display,
             'virtual_address': s['virtual_address'] or 'N/A',
             'bytes_received': s['bytes_received'],
             'bytes_sent': s['bytes_sent'],
