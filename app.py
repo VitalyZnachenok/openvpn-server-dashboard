@@ -12,6 +12,8 @@ import json
 import logging
 import csv
 import io
+import secrets
+from functools import wraps
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -46,6 +48,15 @@ TRAFFIC_HISTORY_RETENTION_DAYS = int(os.getenv("TRAFFIC_HISTORY_RETENTION_DAYS",
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "50"))
 MAX_LIMIT = int(os.getenv("MAX_LIMIT", "500"))
 
+# Authentication configuration
+AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() == "true"
+AUTH_TOKEN = os.getenv("AUTH_TOKEN", "")
+if AUTH_ENABLED and not AUTH_TOKEN:
+    # Generate random token if not provided
+    AUTH_TOKEN = secrets.token_urlsafe(32)
+    logger.warning(f"⚠️  No AUTH_TOKEN provided! Generated random token: {AUTH_TOKEN}")
+    logger.warning("⚠️  Set AUTH_TOKEN environment variable to use a persistent token")
+
 # Multi-server configuration
 # Format: SERVER_NAME:STATUS_FILE:LOG_FILE
 SERVERS_CONFIG = os.getenv("SERVERS_CONFIG", "").split(";")
@@ -67,6 +78,24 @@ if not SERVERS:
         "status_file": os.getenv("OPENVPN_STATUS_FILE", "/var/log/openvpn/openvpn-status.log"),
         "log_file": os.getenv("OPENVPN_LOG_FILE", "/var/log/openvpn/openvpn.log")
     }]
+
+# Authentication decorator
+def require_auth(f):
+    """Decorator to require authentication for API endpoints"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not AUTH_ENABLED:
+            return f(*args, **kwargs)
+        
+        # Get token from Authorization header
+        auth_header = request.headers.get('Authorization', '')
+        token = auth_header.replace('Bearer ', '').strip()
+        
+        if not token or token != AUTH_TOKEN:
+            return jsonify({'error': 'Unauthorized', 'message': 'Invalid or missing authentication token'}), 401
+        
+        return f(*args, **kwargs)
+    return decorated_function
 
 # Data Models
 @dataclass
@@ -776,16 +805,41 @@ db = DatabaseManager(DB_PATH)
 def index():
     return render_template('index.html')
 
+@app.route('/login')
+def login_page():
+    return render_template('login.html')
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    """Verify authentication token"""
+    if not AUTH_ENABLED:
+        return jsonify({'success': True, 'message': 'Authentication disabled'})
+    
+    data = request.get_json() or {}
+    token = data.get('token', '').strip()
+    
+    if token == AUTH_TOKEN:
+        return jsonify({'success': True, 'message': 'Authentication successful'})
+    else:
+        return jsonify({'success': False, 'message': 'Invalid token'}), 401
+
+@app.route('/api/check_auth')
+def check_auth():
+    """Check if authentication is enabled"""
+    return jsonify({'auth_enabled': AUTH_ENABLED})
+
 @app.route('/api/health')
 def health():
     return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
 @app.route('/api/servers')
+@require_auth
 def api_servers():
     """Get list of configured servers"""
     return jsonify([{"name": s["name"], "status_file": s["status_file"]} for s in SERVERS])
 
 @app.route('/api/active_sessions')
+@require_auth
 def api_active_sessions():
     server = request.args.get('server')
     sessions = db.get_active_sessions(server)
@@ -823,6 +877,7 @@ def api_active_sessions():
     return jsonify(formatted_sessions)
 
 @app.route('/api/user_stats')
+@require_auth
 def api_user_stats():
     server = request.args.get('server')
     limit = min(request.args.get('limit', DEFAULT_LIMIT, type=int), MAX_LIMIT)
@@ -883,6 +938,7 @@ def api_user_stats():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/traffic_chart')
+@require_auth
 def api_traffic_chart():
     """Get traffic chart data"""
     server = request.args.get('server')
@@ -892,6 +948,7 @@ def api_traffic_chart():
     return jsonify(data)
 
 @app.route('/api/summary')
+@require_auth
 def api_summary():
     server = request.args.get('server')
     
@@ -952,6 +1009,7 @@ def api_summary():
     })
 
 @app.route('/api/export/sessions')
+@require_auth
 def export_sessions():
     """Export active sessions as CSV or JSON"""
     format_type = request.args.get('format', 'csv')
@@ -983,6 +1041,7 @@ def export_sessions():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/export/users')
+@require_auth
 def export_users():
     """Export user statistics as CSV or JSON"""
     format_type = request.args.get('format', 'csv')

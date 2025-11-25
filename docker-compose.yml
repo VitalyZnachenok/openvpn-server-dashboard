@@ -15,6 +15,10 @@ services:
       - SERVERS_CONFIG=
           office:/var/log/openvpn/status-openvpn.log:/var/log/openvpn/status-openvpn.log;
           office-full:/var/log/openvpn/status-openvpn-full.log:/var/log/openvpn/status-openvpn-full.log
+      # Authentication (recommended for production)
+      - AUTH_ENABLED=true                   # Включить авторизацию
+      - AUTH_TOKEN=                         # Укажите свой токен здесь! (например: python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+      # Data retention
       - RETENTION_DAYS=90                    # Хранение сессий
       - TRAFFIC_HISTORY_RETENTION_DAYS=30   # Хранение трафика
       - DEFAULT_LIMIT=50                    # Лимит по умолчанию

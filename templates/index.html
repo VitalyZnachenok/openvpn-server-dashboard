@@ -344,7 +344,10 @@
     <div class="container">
         <div class="header">
             <h1>🔒 Multi-Server OpenVPN Statistics Dashboard</h1>
-            <button class="theme-toggle" onclick="toggleTheme()">🌙</button>
+            <div style="display: flex; gap: 10px;">
+                <button class="theme-toggle" onclick="toggleTheme()">🌙</button>
+                <button class="theme-toggle" onclick="logout()" title="Logout">🚪</button>
+            </div>
         </div>
         
         <!-- Server Selector -->
@@ -431,6 +434,51 @@
     </div>
     
     <script>
+        // Authentication
+        let authToken = localStorage.getItem('auth_token');
+        let authEnabled = true;
+        
+        // Check authentication on page load
+        async function checkAuth() {
+            try {
+                const response = await fetch('/api/check_auth');
+                const data = await response.json();
+                authEnabled = data.auth_enabled;
+                
+                if (authEnabled && !authToken) {
+                    window.location.href = '/login';
+                    return false;
+                }
+                return true;
+            } catch (e) {
+                console.error('Auth check failed:', e);
+                return false;
+            }
+        }
+        
+        // Logout function
+        function logout() {
+            if (confirm('Are you sure you want to logout?')) {
+                localStorage.removeItem('auth_token');
+                window.location.href = '/login';
+            }
+        }
+        
+        // Override jQuery ajax to add auth header
+        $.ajaxSetup({
+            beforeSend: function(xhr) {
+                if (authToken) {
+                    xhr.setRequestHeader('Authorization', 'Bearer ' + authToken);
+                }
+            },
+            error: function(xhr) {
+                if (xhr.status === 401) {
+                    localStorage.removeItem('auth_token');
+                    window.location.href = '/login';
+                }
+            }
+        });
+        
         let trafficChart = null;
         let usersChart = null;
         let currentServer = '';
@@ -876,7 +924,11 @@
         }
         
         // Initialize
-        $(document).ready(function() {
+        $(document).ready(async function() {
+            // Check authentication first
+            const authOk = await checkAuth();
+            if (!authOk) return;
+            
             loadTheme();
             initCharts();
             loadServers();

@@ -9,6 +9,7 @@ Multi-server OpenVPN monitoring with web interface.
 
 ## Features
 
+- 🔐 **Token-based authentication**
 - Multi-server support
 - Traffic charts (5min-7days)
 - Real-time active sessions
@@ -49,16 +50,80 @@ status /var/log/openvpn/openvpn-status.log
 status-version 2
 ```
 
+## Authentication
+
+The dashboard supports token-based authentication for secure access.
+
+### Setting up authentication token
+
+**Method 1: Using docker-compose.yml (recommended)**
+
+```yaml
+environment:
+  - AUTH_ENABLED=true
+  - AUTH_TOKEN=your-secret-token-here
+```
+
+**Method 2: Generate secure token**
+
+```bash
+# Generate random secure token
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+
+# Example output: xJ8kP2mN5qR9sT4vW7yZ0aB3cD6eF1gH
+
+# Add to docker-compose.yml:
+- AUTH_TOKEN=xJ8kP2mN5qR9sT4vW7yZ0aB3cD6eF1gH
+```
+
+**Method 3: Disable authentication (not recommended)**
+
+```yaml
+environment:
+  - AUTH_ENABLED=false
+```
+
+### First login
+
+1. Start the dashboard: `make up`
+2. Check logs for auto-generated token (if AUTH_TOKEN not set):
+   ```bash
+   make logs | grep "Generated random token"
+   ```
+3. Open http://localhost:80
+4. Enter your token on the login page
+5. Token will be saved in browser localStorage
+
+### Security recommendations
+
+- ✅ Always set a strong `AUTH_TOKEN` in production
+- ✅ Use HTTPS (see SSL section)
+- ✅ Rotate tokens periodically
+- ✅ Keep token secret - don't commit to git
+- ⚠️ If token is compromised, change it immediately
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `AUTH_ENABLED` | `true` | Enable/disable authentication |
+| `AUTH_TOKEN` | (auto-generated) | Authentication token for dashboard access |
 | `UPDATE_INTERVAL` | 60 | Update interval (seconds) |
 | `RETENTION_DAYS` | 90 | Session retention (days) |
 | `TRAFFIC_HISTORY_RETENTION_DAYS` | 30 | Chart data retention (days) |
 
 ## API
 
+All API endpoints (except `/api/login` and `/api/check_auth`) require authentication header:
+
+```bash
+Authorization: Bearer YOUR_TOKEN
+```
+
+### Endpoints
+
+- `POST /api/login` - Verify token and login
+- `GET /api/check_auth` - Check if auth is enabled
 - `GET /api/health` - Health check
 - `GET /api/servers` - Server list
 - `GET /api/summary` - Summary stats
@@ -67,6 +132,13 @@ status-version 2
 - `GET /api/traffic_chart?server=NAME&hours=24` - Traffic data
 - `GET /api/export/sessions?format=csv` - Export sessions
 - `GET /api/export/users?format=json` - Export users
+
+### Example API call
+
+```bash
+curl -H "Authorization: Bearer your-token-here" \
+  http://localhost/api/summary
+```
 
 ## Database
 
