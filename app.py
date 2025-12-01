@@ -206,6 +206,7 @@ class DatabaseManager:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     server_name TEXT NOT NULL,
                     username TEXT,
+                    session_key TEXT,
                     bytes_in INTEGER DEFAULT 0,
                     bytes_out INTEGER DEFAULT 0,
                     active_users INTEGER DEFAULT 0,
@@ -213,8 +214,17 @@ class DatabaseManager:
                 )
             ''')
             
+            # Add session_key column if it doesn't exist (migration for existing databases)
+            try:
+                conn.execute('ALTER TABLE traffic_history ADD COLUMN session_key TEXT')
+                logger.info("Added session_key column to traffic_history table")
+            except sqlite3.OperationalError:
+                # Column already exists
+                pass
+            
             conn.execute('CREATE INDEX IF NOT EXISTS idx_traffic_time ON traffic_history(timestamp)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_traffic_server ON traffic_history(server_name)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_traffic_session_key ON traffic_history(session_key)')
             
             conn.commit()
             logger.info(f"Database initialized at {self.db_path}")
@@ -269,84 +279,115 @@ class DatabaseManager:
             
             conn.commit()
     
-    def save_traffic_snapshot(self, server_name: str, sessions: List[VPNSession]):
-        """Save traffic snapshot for charts (delta from previous snapshot)"""
+    def save_traffic_snapshot(self, server_name: str, sessions: List[VPNSession], disconnected_sessions: List[Dict] = None):
+        """Save traffic snapshot for charts (delta from previous snapshot)
+        
+        Args:
+            server_name: Name of the VPN server
+            sessions: List of currently active VPN sessions
+            disconnected_sessions: List of sessions that were disconnected since last snapshot
+        """
         with sqlite3.connect(self.db_path) as conn:
-            prev_sessions = {}
+            # Build session_key -> previous traffic mapping
+            prev_session_traffic = {}
             
-            # Fetch previous session states
+            # Fetch previous session states by session_key
             last_timestamp_query = conn.execute('''
                 SELECT MAX(timestamp) FROM traffic_history 
-                WHERE server_name = ? AND username IS NOT NULL
+                WHERE server_name = ? AND session_key IS NOT NULL
             ''', (server_name,)).fetchone()
             
             if last_timestamp_query and last_timestamp_query[0]:
                 last_timestamp = last_timestamp_query[0]
                 prev_data = conn.execute('''
-                    SELECT username, bytes_in, bytes_out, timestamp
+                    SELECT session_key, bytes_in, bytes_out
                     FROM traffic_history
-                    WHERE server_name = ? AND username IS NOT NULL AND timestamp = ?
+                    WHERE server_name = ? AND session_key IS NOT NULL AND timestamp = ?
                 ''', (server_name, last_timestamp)).fetchall()
                 
                 for row in prev_data:
-                    username = row[0]
-                    if username not in prev_sessions:
-                        prev_sessions[username] = []
-                    prev_sessions[username].append({
+                    session_key = row[0]
+                    prev_session_traffic[session_key] = {
                         'bytes_in': row[1],
                         'bytes_out': row[2]
-                    })
+                    }
             
             total_delta_in = 0
             total_delta_out = 0
             active_users = len(set(s.username for s in sessions))
             
-            current_sessions_by_user = {}
+            # Calculate deltas for each active session individually
             for session in sessions:
-                if session.username not in current_sessions_by_user:
-                    current_sessions_by_user[session.username] = []
-                current_sessions_by_user[session.username].append(session)
-            
-            for username, user_sessions in current_sessions_by_user.items():
-                prev_user_sessions = prev_sessions.get(username, [])
+                session_key = f"{session.username}:{session.real_address}:{session.real_address_port}"
+                prev = prev_session_traffic.get(session_key)
                 
-                current_user_in = sum(s.bytes_received for s in user_sessions)
-                current_user_out = sum(s.bytes_sent for s in user_sessions)
-                
-                prev_user_in = sum(p['bytes_in'] for p in prev_user_sessions)
-                prev_user_out = sum(p['bytes_out'] for p in prev_user_sessions)
-                
-                if prev_user_sessions:
-                    if current_user_in >= prev_user_in:
-                        user_delta_in = current_user_in - prev_user_in
+                if prev:
+                    # Existing session - calculate delta
+                    if session.bytes_received >= prev['bytes_in']:
+                        delta_in = session.bytes_received - prev['bytes_in']
                     else:
-                        user_delta_in = current_user_in
-                        logger.info(f"[{server_name}] Counter reset: {username} (IN: {prev_user_in} -> {current_user_in})")
+                        # Counter reset (reconnection with same key but new session)
+                        delta_in = session.bytes_received
+                        logger.info(f"[{server_name}] Counter reset detected for {session.username} "
+                                   f"(IN: {prev['bytes_in']} -> {session.bytes_received})")
                     
-                    if current_user_out >= prev_user_out:
-                        user_delta_out = current_user_out - prev_user_out
+                    if session.bytes_sent >= prev['bytes_out']:
+                        delta_out = session.bytes_sent - prev['bytes_out']
                     else:
-                        user_delta_out = current_user_out
-                        logger.info(f"[{server_name}] Counter reset: {username} (OUT: {prev_user_out} -> {current_user_out})")
+                        delta_out = session.bytes_sent
+                        logger.info(f"[{server_name}] Counter reset detected for {session.username} "
+                                   f"(OUT: {prev['bytes_out']} -> {session.bytes_sent})")
                 else:
-                    user_delta_in = current_user_in
-                    user_delta_out = current_user_out
+                    # New session - first snapshot, use current values as delta
+                    # This assumes the session just started or it's a new session we haven't seen
+                    delta_in = session.bytes_received
+                    delta_out = session.bytes_sent
                 
-                total_delta_in += user_delta_in
-                total_delta_out += user_delta_out
+                total_delta_in += delta_in
+                total_delta_out += delta_out
                 
-                for session in user_sessions:
-                    conn.execute('''
-                        INSERT INTO traffic_history (server_name, username, bytes_in, bytes_out, active_users)
-                        VALUES (?, ?, ?, ?, 0)
-                    ''', (server_name, session.username, session.bytes_received, session.bytes_sent))
+                # Save current session traffic for next snapshot comparison
+                conn.execute('''
+                    INSERT INTO traffic_history (server_name, username, session_key, bytes_in, bytes_out, active_users)
+                    VALUES (?, ?, ?, ?, ?, 0)
+                ''', (server_name, session.username, session_key, session.bytes_received, session.bytes_sent))
             
+            # Account for traffic from disconnected sessions (final traffic that wasn't counted yet)
+            if disconnected_sessions:
+                for disc_session in disconnected_sessions:
+                    session_key = f"{disc_session['username']}:{disc_session['real_address']}:{disc_session.get('real_address_port', 'unknown')}"
+                    prev = prev_session_traffic.get(session_key)
+                    
+                    if prev:
+                        # Calculate final delta for disconnected session
+                        final_bytes_in = disc_session['bytes_received']
+                        final_bytes_out = disc_session['bytes_sent']
+                        
+                        if final_bytes_in >= prev['bytes_in']:
+                            delta_in = final_bytes_in - prev['bytes_in']
+                        else:
+                            delta_in = 0  # Already counted or counter was reset
+                        
+                        if final_bytes_out >= prev['bytes_out']:
+                            delta_out = final_bytes_out - prev['bytes_out']
+                        else:
+                            delta_out = 0
+                        
+                        total_delta_in += delta_in
+                        total_delta_out += delta_out
+                        
+                        if delta_in > 0 or delta_out > 0:
+                            logger.debug(f"[{server_name}] Final traffic for disconnected {disc_session['username']}: "
+                                       f"Δ{delta_in/(1024**2):.2f}MB in, Δ{delta_out/(1024**2):.2f}MB out")
+            
+            # Save aggregated delta record (without session_key, for chart queries)
             conn.execute('''
                 INSERT INTO traffic_history (server_name, bytes_in, bytes_out, active_users)
                 VALUES (?, ?, ?, ?)
             ''', (server_name, total_delta_in, total_delta_out, active_users))
             
-            logger.debug(f"[{server_name}] Traffic snapshot: Δ{total_delta_in/(1024**2):.2f}MB in, Δ{total_delta_out/(1024**2):.2f}MB out, {active_users} unique users")
+            logger.debug(f"[{server_name}] Traffic snapshot: Δ{total_delta_in/(1024**2):.2f}MB in, "
+                        f"Δ{total_delta_out/(1024**2):.2f}MB out, {active_users} unique users")
             
             conn.commit()
     
@@ -723,14 +764,7 @@ class MultiServerStatsCollector:
                 # Parse current status
                 sessions = parser.parse_status_file()
                 
-                if not sessions:
-                    logger.warning(f"[{server_name}] No sessions found")
-                    continue
-                
-                # Save traffic snapshot for charts
-                self.db.save_traffic_snapshot(server_name, sessions)
-                
-                # Get active sessions from DB
+                # Get active sessions from DB BEFORE processing
                 db_active_sessions = self.db.get_active_sessions(server_name)
                 
                 # Create set of current session keys (username + real_address + port)
@@ -738,11 +772,10 @@ class MultiServerStatsCollector:
                 for session in sessions:
                     key = (session.username, session.real_address, session.real_address_port)
                     current_session_keys.add(key)
-                    self.db.save_session(session)
-                    self.db.update_user_stats(session.username, server_name)
                 
-                # Mark disconnected sessions - check by username + real_address + port
-                disconnected_count = 0
+                # Identify disconnected sessions BEFORE saving traffic snapshot
+                # This allows us to account for their final traffic in the delta calculation
+                disconnected_sessions_data = []
                 for db_session in db_active_sessions:
                     db_key = (
                         db_session['username'],
@@ -751,7 +784,17 @@ class MultiServerStatsCollector:
                     )
                     
                     if db_key not in current_session_keys:
-                        # This specific session is no longer active
+                        # This session is no longer active - collect its data for traffic calculation
+                        disconnected_sessions_data.append(db_session)
+                
+                # Save traffic snapshot for charts (including final traffic from disconnected sessions)
+                if sessions or disconnected_sessions_data:
+                    self.db.save_traffic_snapshot(server_name, sessions, disconnected_sessions_data)
+                
+                if not sessions:
+                    logger.warning(f"[{server_name}] No active sessions found")
+                    # Still need to mark disconnected sessions
+                    for db_session in disconnected_sessions_data:
                         disconnected_session = VPNSession(
                             username=db_session['username'],
                             real_address=db_session['real_address'],
@@ -765,7 +808,30 @@ class MultiServerStatsCollector:
                         )
                         self.db.save_session(disconnected_session)
                         self.db.update_user_stats(db_session['username'], server_name)
-                        disconnected_count += 1
+                    continue
+                
+                # Save current active sessions to DB
+                for session in sessions:
+                    self.db.save_session(session)
+                    self.db.update_user_stats(session.username, server_name)
+                
+                # Mark disconnected sessions as disconnected in DB
+                disconnected_count = 0
+                for db_session in disconnected_sessions_data:
+                    disconnected_session = VPNSession(
+                        username=db_session['username'],
+                        real_address=db_session['real_address'],
+                        real_address_port=db_session.get('real_address_port', 'unknown'),
+                        virtual_address=db_session['virtual_address'],
+                        bytes_received=db_session['bytes_received'],
+                        bytes_sent=db_session['bytes_sent'],
+                        connected_since=datetime.fromisoformat(db_session['connected_since']),
+                        server_name=server_name,
+                        disconnected_at=datetime.now()
+                    )
+                    self.db.save_session(disconnected_session)
+                    self.db.update_user_stats(db_session['username'], server_name)
+                    disconnected_count += 1
                 
                 logger.info(f"[{server_name}] Updated: {len(sessions)} active, {disconnected_count} disconnected")
                 
