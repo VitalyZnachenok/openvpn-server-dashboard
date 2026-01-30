@@ -14,6 +14,8 @@ Multi-server OpenVPN monitoring with web interface.
 - Traffic charts (5min-7days)
 - Real-time active sessions
 - User statistics with search/sort
+- 📊 **User traffic comparison** (up to 10 users on one chart)
+- 📋 **Session details viewer** (active and recent sessions per user)
 - CSV/JSON export
 - Multiple simultaneous sessions per user
 - Auto-cleanup
@@ -130,6 +132,9 @@ Authorization: Bearer YOUR_TOKEN
 - `GET /api/active_sessions?server=NAME` - Active sessions
 - `GET /api/user_stats?server=NAME&limit=50&search=user` - User stats
 - `GET /api/traffic_chart?server=NAME&hours=24` - Traffic data
+- `GET /api/user_traffic_chart?users=user1,user2&hours=24` - User comparison chart data
+- `GET /api/user_sessions/<username>?server=NAME` - User sessions list
+- `GET /api/users_list?server=NAME` - All users list for dropdown
 - `GET /api/export/sessions?format=csv` - Export sessions
 - `GET /api/export/users?format=json` - Export users
 
@@ -139,6 +144,25 @@ Authorization: Bearer YOUR_TOKEN
 curl -H "Authorization: Bearer your-token-here" \
   http://localhost/api/summary
 ```
+
+## User Comparison Feature
+
+Compare traffic consumption of multiple users on a single chart.
+
+### How to use
+
+1. **Via dropdown**: Select users from "Add user to compare" dropdown
+2. **Via tables**: Click on username in Active Sessions or User Statistics tables
+3. **View sessions**: Click 📋 icon next to username to see all sessions
+4. **Compare**: Up to 10 users can be compared simultaneously
+
+### Features
+
+- Real-time traffic comparison chart
+- Per-user statistics cards (download/upload totals)
+- Session details modal (active + recent 7 days)
+- Color-coded visualization
+- Time range selector (1h, 6h, 24h, 7d)
 
 ## Database
 
