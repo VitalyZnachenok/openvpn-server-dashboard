@@ -609,6 +609,227 @@ class DatabaseManager:
                 'users': [int(row[3]) if row[3] else 0 for row in rows]
             }
     
+    def get_user_traffic_history(self, usernames: List[str], hours: float = 24, 
+                                  server_name: Optional[str] = None,
+                                  session_key: Optional[str] = None) -> Dict:
+        """Get traffic history for specific users (for comparison charts)
+        
+        Args:
+            usernames: List of usernames to get traffic for
+            hours: Time period in hours
+            server_name: Optional server filter
+            session_key: Optional specific session filter
+            
+        Returns:
+            Dict with labels and datasets for each user
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            since = datetime.now() - timedelta(hours=hours)
+            
+            # Determine time interval based on period
+            if hours <= 1:
+                interval_format = '%Y-%m-%d %H:%M'
+                interval_name = 'minute'
+            elif hours <= 6:
+                interval_format = '%Y-%m-%d %H:%M'
+                interval_name = 'minute'
+            elif hours <= 24:
+                interval_format = '%Y-%m-%d %H:00'
+                interval_name = 'hour'
+            else:
+                interval_format = '%Y-%m-%d'
+                interval_name = 'day'
+            
+            # Get all unique time slots first
+            time_slots_query = f'''
+                SELECT DISTINCT strftime('{interval_format}', timestamp) as time_slot
+                FROM traffic_history
+                WHERE timestamp > ? AND session_key IS NOT NULL
+                ORDER BY time_slot
+            '''
+            time_slots = [row[0] for row in conn.execute(time_slots_query, (since,)).fetchall() if row[0]]
+            
+            # Format labels
+            labels = []
+            for ts in time_slots:
+                if interval_name in ('hour', 'minute'):
+                    labels.append(ts.split(' ')[1] if ' ' in ts else ts)
+                else:
+                    labels.append(ts)
+            
+            datasets = {}
+            
+            for username in usernames:
+                # Build query based on filters
+                params = [since, username]
+                server_filter = ""
+                session_filter = ""
+                
+                if server_name:
+                    server_filter = " AND server_name = ?"
+                    params.append(server_name)
+                
+                if session_key:
+                    session_filter = " AND session_key = ?"
+                    params.append(session_key)
+                
+                # Get traffic data for this user
+                # We need to calculate deltas from cumulative values
+                query = f'''
+                    SELECT 
+                        strftime('{interval_format}', timestamp) as time_slot,
+                        session_key,
+                        bytes_in,
+                        bytes_out,
+                        timestamp
+                    FROM traffic_history
+                    WHERE timestamp > ? AND username = ? AND session_key IS NOT NULL
+                    {server_filter} {session_filter}
+                    ORDER BY session_key, timestamp
+                '''
+                
+                rows = conn.execute(query, params).fetchall()
+                
+                # Calculate deltas per session, then aggregate by time slot
+                session_data = {}  # session_key -> list of (time_slot, bytes_in, bytes_out)
+                
+                for row in rows:
+                    time_slot, sess_key, bytes_in, bytes_out, _ = row
+                    if not time_slot:
+                        continue
+                    if sess_key not in session_data:
+                        session_data[sess_key] = []
+                    session_data[sess_key].append({
+                        'time_slot': time_slot,
+                        'bytes_in': bytes_in or 0,
+                        'bytes_out': bytes_out or 0
+                    })
+                
+                # Calculate deltas for each session
+                time_slot_deltas = {}  # time_slot -> {'in': delta_in, 'out': delta_out}
+                
+                for sess_key, data_points in session_data.items():
+                    prev_in = 0
+                    prev_out = 0
+                    
+                    for i, dp in enumerate(data_points):
+                        time_slot = dp['time_slot']
+                        
+                        if time_slot not in time_slot_deltas:
+                            time_slot_deltas[time_slot] = {'in': 0, 'out': 0}
+                        
+                        if i == 0:
+                            # First point for this session - use as delta (new session)
+                            delta_in = dp['bytes_in']
+                            delta_out = dp['bytes_out']
+                        else:
+                            # Calculate delta from previous
+                            if dp['bytes_in'] >= prev_in:
+                                delta_in = dp['bytes_in'] - prev_in
+                            else:
+                                # Counter reset
+                                delta_in = dp['bytes_in']
+                            
+                            if dp['bytes_out'] >= prev_out:
+                                delta_out = dp['bytes_out'] - prev_out
+                            else:
+                                delta_out = dp['bytes_out']
+                        
+                        time_slot_deltas[time_slot]['in'] += delta_in
+                        time_slot_deltas[time_slot]['out'] += delta_out
+                        
+                        prev_in = dp['bytes_in']
+                        prev_out = dp['bytes_out']
+                
+                # Build arrays aligned with time_slots
+                inbound = []
+                outbound = []
+                
+                for ts in time_slots:
+                    if ts in time_slot_deltas:
+                        inbound.append(time_slot_deltas[ts]['in'] / (1024**2))  # MB
+                        outbound.append(time_slot_deltas[ts]['out'] / (1024**2))  # MB
+                    else:
+                        inbound.append(0)
+                        outbound.append(0)
+                
+                datasets[username] = {
+                    'inbound': inbound,
+                    'outbound': outbound,
+                    'total_in_mb': sum(inbound),
+                    'total_out_mb': sum(outbound)
+                }
+            
+            return {
+                'labels': labels,
+                'datasets': datasets,
+                'interval': interval_name
+            }
+    
+    def get_user_sessions_list(self, username: str, server_name: Optional[str] = None) -> List[Dict]:
+        """Get list of sessions for a user (active and recent)"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            
+            params = [username]
+            server_filter = ""
+            
+            if server_name:
+                server_filter = " AND server_name = ?"
+                params.append(server_name)
+            
+            # Get active sessions
+            active = conn.execute(f'''
+                SELECT 
+                    id,
+                    username,
+                    server_name,
+                    real_address,
+                    real_address_port,
+                    virtual_address,
+                    bytes_received,
+                    bytes_sent,
+                    connected_since,
+                    'active' as status
+                FROM sessions
+                WHERE username = ? AND disconnected_at IS NULL {server_filter}
+                ORDER BY connected_since DESC
+            ''', params).fetchall()
+            
+            # Get recent completed sessions (last 7 days)
+            week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+            params_recent = [username, week_ago]
+            if server_name:
+                params_recent.append(server_name)
+            
+            recent = conn.execute(f'''
+                SELECT 
+                    id,
+                    username,
+                    server_name,
+                    real_address,
+                    real_address_port,
+                    virtual_address,
+                    bytes_received,
+                    bytes_sent,
+                    connected_since,
+                    disconnected_at,
+                    'completed' as status
+                FROM sessions
+                WHERE username = ? AND disconnected_at IS NOT NULL 
+                AND disconnected_at > ? {server_filter}
+                ORDER BY disconnected_at DESC
+                LIMIT 20
+            ''', params_recent).fetchall()
+            
+            sessions = []
+            for row in list(active) + list(recent):
+                session = dict(row)
+                session['session_key'] = f"{session['username']}:{session['real_address']}:{session['real_address_port']}"
+                sessions.append(session)
+            
+            return sessions
+    
     def cleanup_old_data(self):
         """Remove old data based on retention policy"""
         try:
@@ -1012,6 +1233,117 @@ def api_traffic_chart():
     
     data = db.get_traffic_history(hours, server)
     return jsonify(data)
+
+@app.route('/api/user_traffic_chart')
+@require_auth
+def api_user_traffic_chart():
+    """Get traffic chart data for specific users (comparison)
+    
+    Query params:
+        users: comma-separated list of usernames
+        hours: time period (default 24)
+        server: optional server filter
+        session_key: optional specific session filter
+    """
+    users_param = request.args.get('users', '')
+    hours = request.args.get('hours', 24, type=float)
+    server = request.args.get('server')
+    session_key = request.args.get('session_key')
+    
+    if not users_param:
+        return jsonify({'error': 'No users specified'}), 400
+    
+    usernames = [u.strip() for u in users_param.split(',') if u.strip()]
+    
+    if not usernames:
+        return jsonify({'error': 'No valid usernames provided'}), 400
+    
+    if len(usernames) > 10:
+        return jsonify({'error': 'Maximum 10 users for comparison'}), 400
+    
+    try:
+        data = db.get_user_traffic_history(usernames, hours, server, session_key)
+        return jsonify(data)
+    except Exception as e:
+        logger.error(f"Error fetching user traffic chart: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/user_sessions/<username>')
+@require_auth
+def api_user_sessions(username):
+    """Get list of sessions for a specific user"""
+    server = request.args.get('server')
+    
+    try:
+        sessions = db.get_user_sessions_list(username, server)
+        
+        # Format sessions for response
+        formatted = []
+        for s in sessions:
+            connected_since = datetime.fromisoformat(s['connected_since'])
+            
+            if s['status'] == 'active':
+                duration = int((datetime.now() - connected_since).total_seconds())
+            else:
+                disconnected_at = datetime.fromisoformat(s['disconnected_at'])
+                duration = int((disconnected_at - connected_since).total_seconds())
+            
+            hours = duration // 3600
+            minutes = (duration % 3600) // 60
+            secs = duration % 60
+            duration_str = f"{hours:02d}:{minutes:02d}:{secs:02d}"
+            
+            formatted.append({
+                'id': s['id'],
+                'session_key': s['session_key'],
+                'server_name': s['server_name'],
+                'real_address': f"{s['real_address']}:{s['real_address_port']}",
+                'virtual_address': s['virtual_address'] or 'N/A',
+                'bytes_received': s['bytes_received'],
+                'bytes_sent': s['bytes_sent'],
+                'download_mb': round(s['bytes_received'] / (1024**2), 2),
+                'upload_mb': round(s['bytes_sent'] / (1024**2), 2),
+                'connected_since': s['connected_since'],
+                'disconnected_at': s.get('disconnected_at'),
+                'duration': duration_str,
+                'status': s['status']
+            })
+        
+        return jsonify(formatted)
+    except Exception as e:
+        logger.error(f"Error fetching user sessions: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/users_list')
+@require_auth
+def api_users_list():
+    """Get list of all users for dropdown selection"""
+    server = request.args.get('server')
+    
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            if server:
+                rows = conn.execute('''
+                    SELECT DISTINCT username, 
+                           MAX(CASE WHEN disconnected_at IS NULL THEN 1 ELSE 0 END) as is_online
+                    FROM sessions 
+                    WHERE server_name = ?
+                    GROUP BY username
+                    ORDER BY is_online DESC, username
+                ''', (server,)).fetchall()
+            else:
+                rows = conn.execute('''
+                    SELECT DISTINCT username,
+                           MAX(CASE WHEN disconnected_at IS NULL THEN 1 ELSE 0 END) as is_online
+                    FROM sessions
+                    GROUP BY username
+                    ORDER BY is_online DESC, username
+                ''').fetchall()
+            
+            return jsonify([{'username': r[0], 'is_online': bool(r[1])} for r in rows])
+    except Exception as e:
+        logger.error(f"Error fetching users list: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/summary')
 @require_auth

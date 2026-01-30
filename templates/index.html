@@ -338,6 +338,198 @@
             color: var(--arrow-down);
             font-size: 0.9em;
         }
+        
+        /* User comparison section */
+        .user-comparison {
+            background: var(--card-bg);
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        }
+        .comparison-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        .comparison-title {
+            font-size: 1.3em;
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+        .user-select-container {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .user-select-container select {
+            padding: 8px 15px;
+            border-radius: 20px;
+            border: 1px solid var(--input-border);
+            background: var(--input-bg);
+            color: var(--text-primary);
+            font-size: 14px;
+            min-width: 180px;
+            cursor: pointer;
+        }
+        .selected-users {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 15px;
+            min-height: 36px;
+        }
+        .user-tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            background: var(--stat-color);
+            color: white;
+            border-radius: 20px;
+            font-size: 13px;
+            animation: fadeIn 0.3s ease;
+        }
+        .user-tag.offline {
+            background: var(--status-offline);
+        }
+        .user-tag .remove-user {
+            cursor: pointer;
+            opacity: 0.8;
+            font-size: 14px;
+        }
+        .user-tag .remove-user:hover {
+            opacity: 1;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: scale(0.9); }
+            to { opacity: 1; transform: scale(1); }
+        }
+        .comparison-chart-container {
+            display: none;
+            margin-top: 20px;
+        }
+        .comparison-chart-container.visible {
+            display: block;
+        }
+        .comparison-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        .user-stat-card {
+            padding: 15px;
+            border-radius: 10px;
+            background: var(--hover-bg);
+            border-left: 4px solid var(--stat-color);
+        }
+        .user-stat-card .username {
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 8px;
+        }
+        .user-stat-card .stat-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+        
+        /* Modal for session details */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.6);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal-overlay.visible {
+            display: flex;
+        }
+        .modal-content {
+            background: var(--card-bg);
+            border-radius: 15px;
+            padding: 30px;
+            max-width: 800px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .modal-title {
+            font-size: 1.4em;
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+        .modal-close {
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: var(--text-secondary);
+            padding: 5px;
+        }
+        .modal-close:hover {
+            color: var(--text-primary);
+        }
+        .session-list {
+            margin-top: 15px;
+        }
+        .session-item {
+            padding: 15px;
+            border-radius: 10px;
+            background: var(--hover-bg);
+            margin-bottom: 10px;
+            border-left: 4px solid var(--stat-color);
+        }
+        .session-item.completed {
+            border-left-color: var(--status-offline);
+            opacity: 0.8;
+        }
+        .session-item .session-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .session-item .session-ip {
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+        .session-item .session-details {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 10px;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        .clickable-user {
+            cursor: pointer;
+            text-decoration: underline;
+            text-decoration-style: dotted;
+        }
+        .clickable-user:hover {
+            color: var(--stat-color);
+        }
     </style>
 </head>
 <body>
@@ -399,6 +591,45 @@
                 <div class="chart-container">
                     <canvas id="usersChart"></canvas>
                 </div>
+            </div>
+        </div>
+        
+        <!-- User Comparison Section -->
+        <div class="user-comparison">
+            <div class="comparison-header">
+                <div class="comparison-title">📈 User Traffic Comparison</div>
+                <div class="user-select-container">
+                    <select id="userCompareSelect">
+                        <option value="">+ Add user to compare...</option>
+                    </select>
+                    <select id="compareTimeRange">
+                        <option value="1">Last 1 Hour</option>
+                        <option value="6">Last 6 Hours</option>
+                        <option value="24" selected>Last 24 Hours</option>
+                        <option value="168">Last 7 Days</option>
+                    </select>
+                    <button class="btn btn-small" onclick="clearComparison()">Clear All</button>
+                </div>
+            </div>
+            <div class="selected-users" id="selectedUsers">
+                <span style="color: var(--text-secondary); font-size: 13px;">Click on usernames in tables below or select from dropdown to add users for comparison</span>
+            </div>
+            <div class="comparison-chart-container" id="comparisonChartContainer">
+                <div class="chart-container">
+                    <canvas id="comparisonChart"></canvas>
+                </div>
+                <div class="comparison-stats" id="comparisonStats"></div>
+            </div>
+        </div>
+        
+        <!-- User Sessions Modal -->
+        <div class="modal-overlay" id="sessionsModal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <div class="modal-title" id="modalTitle">User Sessions</div>
+                    <button class="modal-close" onclick="closeSessionsModal()">&times;</button>
+                </div>
+                <div id="modalContent">Loading...</div>
             </div>
         </div>
         
@@ -481,6 +712,7 @@
         
         let trafficChart = null;
         let usersChart = null;
+        let comparisonChart = null;
         let currentServer = '';
         let currentPage = 0;
         let pageSize = 20;
@@ -488,6 +720,22 @@
         let searchQuery = '';
         let allUserStats = [];
         let allActiveSessions = [];
+        let allUsersList = [];
+        let selectedUsersForComparison = [];
+        
+        // Chart colors for comparison
+        const chartColors = [
+            { border: '#667eea', bg: 'rgba(102, 126, 234, 0.2)' },
+            { border: '#10b981', bg: 'rgba(16, 185, 129, 0.2)' },
+            { border: '#ef4444', bg: 'rgba(239, 68, 68, 0.2)' },
+            { border: '#f59e0b', bg: 'rgba(245, 158, 11, 0.2)' },
+            { border: '#8b5cf6', bg: 'rgba(139, 92, 246, 0.2)' },
+            { border: '#ec4899', bg: 'rgba(236, 72, 153, 0.2)' },
+            { border: '#06b6d4', bg: 'rgba(6, 182, 212, 0.2)' },
+            { border: '#84cc16', bg: 'rgba(132, 204, 22, 0.2)' },
+            { border: '#f97316', bg: 'rgba(249, 115, 22, 0.2)' },
+            { border: '#6366f1', bg: 'rgba(99, 102, 241, 0.2)' }
+        ];
         
         // Sorting state
         let sessionSort = { column: null, direction: 'asc' };
@@ -504,7 +752,12 @@
             document.querySelector('.theme-toggle').textContent = newTheme === 'dark' ? '☀️' : '🌙';
             
             // Recreate charts with new theme
+            initCharts();
+            initComparisonChart();
             updateCharts();
+            if (selectedUsersForComparison.length > 0) {
+                updateComparisonChart();
+            }
         }
         
         // Load saved theme
@@ -797,7 +1050,8 @@
                 
                 sortedData.forEach(session => {
                     tableHtml += '<tr>' +
-                        '<td><strong>' + session.username + '</strong></td>' +
+                        '<td><strong class="clickable-user" onclick="addUserToComparison(\'' + session.username + '\')" title="Add to comparison">' + session.username + '</strong> ' +
+                        '<span style="cursor:pointer; font-size:0.8em;" onclick="showUserSessions(\'' + session.username + '\')" title="View sessions">📋</span></td>' +
                         '<td><span class="server-badge">' + session.server_name + '</span></td>' +
                         '<td>' + session.real_address + '</td>' +
                         '<td>' + session.virtual_address + '</td>' +
@@ -852,7 +1106,8 @@
                     const lastSeen = new Date(user.last_seen).toLocaleString();
                     
                     tableHtml += '<tr>' +
-                        '<td><strong>' + user.username + '</strong></td>';
+                        '<td><strong class="clickable-user" onclick="addUserToComparison(\'' + user.username + '\')" title="Add to comparison">' + user.username + '</strong> ' +
+                        '<span style="cursor:pointer; font-size:0.8em;" onclick="showUserSessions(\'' + user.username + '\')" title="View sessions">📋</span></td>';
                     
                     if (!currentServer && user.servers) {
                         const servers = user.servers.split(',').map(s => 
@@ -923,6 +1178,308 @@
             });
         }
         
+        // ==================== USER COMPARISON ====================
+        
+        // Load users list for dropdown
+        function loadUsersList() {
+            const params = currentServer ? `?server=${currentServer}` : '';
+            $.get('/api/users_list' + params, function(data) {
+                allUsersList = data;
+                renderUsersDropdown();
+            });
+        }
+        
+        function renderUsersDropdown() {
+            const select = $('#userCompareSelect');
+            select.html('<option value="">+ Add user to compare...</option>');
+            
+            allUsersList.forEach(user => {
+                const status = user.is_online ? '🟢' : '⚪';
+                const disabled = selectedUsersForComparison.includes(user.username) ? 'disabled' : '';
+                select.append(`<option value="${user.username}" ${disabled}>${status} ${user.username}</option>`);
+            });
+        }
+        
+        // Add user to comparison
+        function addUserToComparison(username) {
+            if (!username || selectedUsersForComparison.includes(username)) return;
+            if (selectedUsersForComparison.length >= 10) {
+                alert('Maximum 10 users for comparison');
+                return;
+            }
+            
+            selectedUsersForComparison.push(username);
+            renderSelectedUsers();
+            renderUsersDropdown();
+            updateComparisonChart();
+        }
+        
+        // Remove user from comparison
+        function removeUserFromComparison(username) {
+            selectedUsersForComparison = selectedUsersForComparison.filter(u => u !== username);
+            renderSelectedUsers();
+            renderUsersDropdown();
+            updateComparisonChart();
+        }
+        
+        // Clear all comparison
+        function clearComparison() {
+            selectedUsersForComparison = [];
+            renderSelectedUsers();
+            renderUsersDropdown();
+            $('#comparisonChartContainer').removeClass('visible');
+            $('#comparisonStats').html('');
+        }
+        
+        // Render selected users tags
+        function renderSelectedUsers() {
+            const container = $('#selectedUsers');
+            
+            if (selectedUsersForComparison.length === 0) {
+                container.html('<span style="color: var(--text-secondary); font-size: 13px;">Click on usernames in tables below or select from dropdown to add users for comparison</span>');
+                return;
+            }
+            
+            let html = '';
+            selectedUsersForComparison.forEach(username => {
+                const user = allUsersList.find(u => u.username === username);
+                const isOnline = user ? user.is_online : false;
+                const tagClass = isOnline ? '' : 'offline';
+                
+                html += `<span class="user-tag ${tagClass}">
+                    ${username}
+                    <span class="remove-user" onclick="removeUserFromComparison('${username}')">&times;</span>
+                </span>`;
+            });
+            
+            container.html(html);
+        }
+        
+        // Initialize comparison chart
+        function initComparisonChart() {
+            const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+            const textColor = isDark ? '#e0e0e0' : '#333';
+            const gridColor = isDark ? '#2d3748' : '#eee';
+            
+            const ctx = document.getElementById('comparisonChart').getContext('2d');
+            if (comparisonChart) comparisonChart.destroy();
+            
+            comparisonChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: []
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    aspectRatio: 2.5,
+                    layout: { padding: 10 },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'Traffic (MB)', color: textColor },
+                            ticks: { color: textColor },
+                            grid: { color: gridColor }
+                        },
+                        x: {
+                            ticks: { color: textColor },
+                            grid: { color: gridColor }
+                        }
+                    },
+                    plugins: {
+                        legend: { position: 'top', labels: { color: textColor } },
+                        tooltip: { mode: 'index', intersect: false }
+                    },
+                    interaction: { mode: 'nearest', axis: 'x', intersect: false }
+                }
+            });
+        }
+        
+        // Update comparison chart
+        function updateComparisonChart() {
+            if (selectedUsersForComparison.length === 0) {
+                $('#comparisonChartContainer').removeClass('visible');
+                return;
+            }
+            
+            const users = selectedUsersForComparison.join(',');
+            const hours = $('#compareTimeRange').val() || 24;
+            const server = currentServer ? `&server=${currentServer}` : '';
+            
+            $.get(`/api/user_traffic_chart?users=${encodeURIComponent(users)}&hours=${hours}${server}`, function(data) {
+                if (!data.labels || data.labels.length === 0) {
+                    $('#comparisonStats').html('<p style="color: var(--text-secondary); text-align: center;">No traffic data available for selected period</p>');
+                    $('#comparisonChartContainer').addClass('visible');
+                    return;
+                }
+                
+                // Build datasets for chart
+                const datasets = [];
+                let colorIndex = 0;
+                
+                for (const username in data.datasets) {
+                    const userData = data.datasets[username];
+                    const color = chartColors[colorIndex % chartColors.length];
+                    
+                    // Combined traffic (in + out) for cleaner visualization
+                    const totalTraffic = userData.inbound.map((val, i) => val + userData.outbound[i]);
+                    
+                    datasets.push({
+                        label: `${username} (Total)`,
+                        data: totalTraffic,
+                        borderColor: color.border,
+                        backgroundColor: color.bg,
+                        tension: 0.3,
+                        fill: false
+                    });
+                    
+                    colorIndex++;
+                }
+                
+                // Update chart
+                if (comparisonChart) {
+                    comparisonChart.data.labels = data.labels;
+                    comparisonChart.data.datasets = datasets;
+                    comparisonChart.update();
+                }
+                
+                // Render stats cards
+                renderComparisonStats(data.datasets);
+                
+                $('#comparisonChartContainer').addClass('visible');
+            }).fail(function() {
+                console.error('Failed to load user traffic data');
+            });
+        }
+        
+        // Render comparison statistics cards
+        function renderComparisonStats(datasets) {
+            let html = '';
+            let colorIndex = 0;
+            
+            for (const username in datasets) {
+                const userData = datasets[username];
+                const color = chartColors[colorIndex % chartColors.length];
+                
+                html += `<div class="user-stat-card" style="border-left-color: ${color.border}">
+                    <div class="username">${username}</div>
+                    <div class="stat-row">
+                        <span>↓ Download:</span>
+                        <strong>${userData.total_in_mb.toFixed(2)} MB</strong>
+                    </div>
+                    <div class="stat-row">
+                        <span>↑ Upload:</span>
+                        <strong>${userData.total_out_mb.toFixed(2)} MB</strong>
+                    </div>
+                    <div class="stat-row">
+                        <span>Total:</span>
+                        <strong>${(userData.total_in_mb + userData.total_out_mb).toFixed(2)} MB</strong>
+                    </div>
+                    <div style="margin-top: 10px;">
+                        <button class="btn btn-small" onclick="showUserSessions('${username}')">View Sessions</button>
+                    </div>
+                </div>`;
+                
+                colorIndex++;
+            }
+            
+            $('#comparisonStats').html(html);
+        }
+        
+        // ==================== USER SESSIONS MODAL ====================
+        
+        function showUserSessions(username) {
+            $('#modalTitle').text(`Sessions: ${username}`);
+            $('#modalContent').html('<div class="loading">Loading sessions...</div>');
+            $('#sessionsModal').addClass('visible');
+            
+            const server = currentServer ? `?server=${currentServer}` : '';
+            
+            $.get(`/api/user_sessions/${encodeURIComponent(username)}${server}`, function(sessions) {
+                if (sessions.length === 0) {
+                    $('#modalContent').html('<p style="text-align: center; color: var(--text-secondary);">No sessions found</p>');
+                    return;
+                }
+                
+                let html = '<div class="session-list">';
+                
+                // Group by status
+                const activeSessions = sessions.filter(s => s.status === 'active');
+                const completedSessions = sessions.filter(s => s.status === 'completed');
+                
+                if (activeSessions.length > 0) {
+                    html += '<h4 style="color: var(--status-online); margin-bottom: 10px;">🟢 Active Sessions</h4>';
+                    activeSessions.forEach(session => {
+                        html += renderSessionItem(session);
+                    });
+                }
+                
+                if (completedSessions.length > 0) {
+                    html += '<h4 style="color: var(--text-secondary); margin: 20px 0 10px;">⚪ Recent Sessions (Last 7 days)</h4>';
+                    completedSessions.forEach(session => {
+                        html += renderSessionItem(session);
+                    });
+                }
+                
+                html += '</div>';
+                
+                // Add button to view session-specific chart
+                if (activeSessions.length > 0) {
+                    html += `<div style="margin-top: 20px; text-align: center;">
+                        <button class="btn" onclick="addUserToComparison('${username}'); closeSessionsModal();">
+                            Add to Comparison Chart
+                        </button>
+                    </div>`;
+                }
+                
+                $('#modalContent').html(html);
+            }).fail(function() {
+                $('#modalContent').html('<p style="text-align: center; color: red;">Failed to load sessions</p>');
+            });
+        }
+        
+        function renderSessionItem(session) {
+            const statusClass = session.status === 'completed' ? 'completed' : '';
+            const statusBadge = session.status === 'active' 
+                ? '<span class="status-online">Active</span>' 
+                : '<span class="status-offline">Completed</span>';
+            
+            return `<div class="session-item ${statusClass}">
+                <div class="session-header">
+                    <span class="session-ip">${session.real_address}</span>
+                    ${statusBadge}
+                </div>
+                <div class="session-details">
+                    <div><strong>Server:</strong> ${session.server_name}</div>
+                    <div><strong>Virtual IP:</strong> ${session.virtual_address}</div>
+                    <div><strong>Duration:</strong> ${session.duration}</div>
+                    <div><strong>Download:</strong> ↓ ${session.download_mb} MB</div>
+                    <div><strong>Upload:</strong> ↑ ${session.upload_mb} MB</div>
+                    <div><strong>Connected:</strong> ${new Date(session.connected_since).toLocaleString()}</div>
+                    ${session.disconnected_at ? `<div><strong>Disconnected:</strong> ${new Date(session.disconnected_at).toLocaleString()}</div>` : ''}
+                </div>
+            </div>`;
+        }
+        
+        function closeSessionsModal() {
+            $('#sessionsModal').removeClass('visible');
+        }
+        
+        // Close modal on overlay click
+        $(document).on('click', '#sessionsModal', function(e) {
+            if (e.target === this) {
+                closeSessionsModal();
+            }
+        });
+        
+        // Close modal on Escape key
+        $(document).on('keydown', function(e) {
+            if (e.key === 'Escape') {
+                closeSessionsModal();
+            }
+        });
+        
         // Initialize
         $(document).ready(async function() {
             // Check authentication first
@@ -931,7 +1488,9 @@
             
             loadTheme();
             initCharts();
+            initComparisonChart();
             loadServers();
+            loadUsersList();
             updateDashboard();
             
             // Server selector change
@@ -941,6 +1500,9 @@
                 // Reset sorting when changing servers
                 sessionSort = { column: null, direction: 'asc' };
                 userSort = { column: null, direction: 'asc' };
+                // Reload users list and clear comparison
+                loadUsersList();
+                clearComparison();
                 updateDashboard();
             });
             
@@ -949,8 +1511,28 @@
                 updateCharts();
             });
             
+            // User comparison dropdown change
+            $('#userCompareSelect').change(function() {
+                const username = $(this).val();
+                if (username) {
+                    addUserToComparison(username);
+                    $(this).val(''); // Reset dropdown
+                }
+            });
+            
+            // Comparison time range change
+            $('#compareTimeRange').change(function() {
+                updateComparisonChart();
+            });
+            
             // Auto-refresh every 30 seconds
-            setInterval(updateDashboard, 30000);
+            setInterval(function() {
+                updateDashboard();
+                loadUsersList();
+                if (selectedUsersForComparison.length > 0) {
+                    updateComparisonChart();
+                }
+            }, 30000);
         });
     </script>
 </body>
