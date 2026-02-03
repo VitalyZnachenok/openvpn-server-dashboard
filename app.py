@@ -1349,6 +1349,16 @@ def api_users_list():
 @require_auth
 def api_summary():
     server = request.args.get('server')
+    period = request.args.get('period', 'all')  # day, week, month, all
+    
+    # Calculate date filter based on period
+    date_filter = None
+    if period == 'day':
+        date_filter = datetime.now().strftime('%Y-%m-%d')
+    elif period == 'week':
+        date_filter = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+    elif period == 'month':
+        date_filter = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
     
     with sqlite3.connect(DB_PATH) as conn:
         if server:
@@ -1368,10 +1378,22 @@ def api_summary():
                 (today, server)
             ).fetchone()[0]
             
-            total_traffic = conn.execute(
-                "SELECT SUM(bytes_sent + bytes_received) FROM sessions WHERE server_name = ?",
-                (server,)
-            ).fetchone()[0] or 0
+            # Traffic with period filter
+            if period == 'day':
+                total_traffic = conn.execute(
+                    "SELECT SUM(bytes_sent + bytes_received) FROM sessions WHERE server_name = ? AND DATE(connected_since) = ?",
+                    (server, date_filter)
+                ).fetchone()[0] or 0
+            elif period in ('week', 'month'):
+                total_traffic = conn.execute(
+                    "SELECT SUM(bytes_sent + bytes_received) FROM sessions WHERE server_name = ? AND connected_since >= ?",
+                    (server, date_filter)
+                ).fetchone()[0] or 0
+            else:
+                total_traffic = conn.execute(
+                    "SELECT SUM(bytes_sent + bytes_received) FROM sessions WHERE server_name = ?",
+                    (server,)
+                ).fetchone()[0] or 0
         else:
             active_users = conn.execute(
                 "SELECT COUNT(DISTINCT username) FROM sessions WHERE disconnected_at IS NULL"
@@ -1387,9 +1409,21 @@ def api_summary():
                 (today,)
             ).fetchone()[0]
             
-            total_traffic = conn.execute(
-                "SELECT SUM(bytes_sent + bytes_received) FROM sessions"
-            ).fetchone()[0] or 0
+            # Traffic with period filter
+            if period == 'day':
+                total_traffic = conn.execute(
+                    "SELECT SUM(bytes_sent + bytes_received) FROM sessions WHERE DATE(connected_since) = ?",
+                    (date_filter,)
+                ).fetchone()[0] or 0
+            elif period in ('week', 'month'):
+                total_traffic = conn.execute(
+                    "SELECT SUM(bytes_sent + bytes_received) FROM sessions WHERE connected_since >= ?",
+                    (date_filter,)
+                ).fetchone()[0] or 0
+            else:
+                total_traffic = conn.execute(
+                    "SELECT SUM(bytes_sent + bytes_received) FROM sessions"
+                ).fetchone()[0] or 0
         
         traffic_gb = round(total_traffic / (1024**3), 2)
         
@@ -1398,12 +1432,22 @@ def api_summary():
             "SELECT COUNT(DISTINCT server_name) FROM sessions"
         ).fetchone()[0]
     
+    # Period label for display
+    period_labels = {
+        'day': 'Today',
+        'week': 'Last 7 Days',
+        'month': 'Last 30 Days',
+        'all': 'All Time'
+    }
+    
     return jsonify({
         'active_users': active_users,
         'total_users': total_users,
         'today_sessions': today_sessions,
         'total_traffic_gb': traffic_gb,
-        'server_count': server_count
+        'server_count': server_count,
+        'traffic_period': period,
+        'traffic_period_label': period_labels.get(period, 'All Time')
     })
 
 @app.route('/api/export/sessions')

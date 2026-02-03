@@ -570,7 +570,15 @@
             </div>
             <div class="stat-card">
                 <div class="stat-value" id="totalTraffic">-</div>
-                <div class="stat-label">Total Traffic</div>
+                <div class="stat-label">
+                    Traffic: 
+                    <select id="trafficPeriod" style="background: transparent; border: none; color: var(--text-secondary); cursor: pointer; font-size: inherit;">
+                        <option value="day">Today</option>
+                        <option value="week">Last 7 Days</option>
+                        <option value="month">Last 30 Days</option>
+                        <option value="all" selected>All Time</option>
+                    </select>
+                </div>
             </div>
             <div class="stat-card">
                 <div class="stat-value" id="serverCount">-</div>
@@ -722,6 +730,7 @@
         let allActiveSessions = [];
         let allUsersList = [];
         let selectedUsersForComparison = [];
+        let trafficPeriod = 'all';
         
         // Chart colors for comparison
         const chartColors = [
@@ -1136,10 +1145,13 @@
         
         // Update dashboard
         function updateDashboard() {
-            const params = currentServer ? `?server=${currentServer}` : '';
+            const serverParam = currentServer ? `?server=${currentServer}` : '';
+            const summaryParams = serverParam 
+                ? `${serverParam}&period=${trafficPeriod}` 
+                : `?period=${trafficPeriod}`;
             
             // Update summary stats
-            $.get('/api/summary' + params, function(data) {
+            $.get('/api/summary' + summaryParams, function(data) {
                 $('#activeUsers').text(data.active_users);
                 $('#totalUsers').text(data.total_users);
                 $('#totalTraffic').text(data.total_traffic_gb + ' GB');
@@ -1147,7 +1159,7 @@
             });
             
             // Update active sessions
-            $.get('/api/active_sessions' + params, function(data) {
+            $.get('/api/active_sessions' + serverParam, function(data) {
                 allActiveSessions = data;
                 renderActiveSessions();
             });
@@ -1509,6 +1521,12 @@
             // Time range selector change
             $('#timeRange').change(function() {
                 updateCharts();
+            });
+            
+            // Traffic period selector change
+            $('#trafficPeriod').change(function() {
+                trafficPeriod = $(this).val();
+                updateDashboard();
             });
             
             // User comparison dropdown change
