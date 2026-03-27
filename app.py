@@ -12,6 +12,7 @@ import json
 import logging
 import csv
 import io
+import hmac
 import secrets
 from functools import wraps
 from datetime import datetime, timedelta
@@ -79,6 +80,9 @@ if not SERVERS:
         "log_file": os.getenv("OPENVPN_LOG_FILE", "/var/log/openvpn/openvpn.log")
     }]
 
+# CORS configuration
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "")
+
 # Authentication decorator
 def require_auth(f):
     """Decorator to require authentication for API endpoints"""
@@ -87,11 +91,14 @@ def require_auth(f):
         if not AUTH_ENABLED:
             return f(*args, **kwargs)
         
-        # Get token from Authorization header
+        # Get token from Authorization header or query parameter (for export/download links)
         auth_header = request.headers.get('Authorization', '')
         token = auth_header.replace('Bearer ', '').strip()
         
-        if not token or token != AUTH_TOKEN:
+        if not token:
+            token = request.args.get('token', '').strip()
+        
+        if not token or not hmac.compare_digest(token, AUTH_TOKEN):
             return jsonify({'error': 'Unauthorized', 'message': 'Invalid or missing authentication token'}), 401
         
         return f(*args, **kwargs)
@@ -135,11 +142,16 @@ class DatabaseManager:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.init_db()
     
+    def _connect(self) -> sqlite3.Connection:
+        """Create a connection with standard PRAGMA settings"""
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+    
     def init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            
-            # Enhanced sessions table with server_name
+        with self._connect() as conn:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS sessions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,34 +169,29 @@ class DatabaseManager:
                 )
             ''')
             
-            # Add real_address_port column if it doesn't exist (migration for existing databases)
             try:
                 conn.execute('ALTER TABLE sessions ADD COLUMN real_address_port TEXT')
                 logger.info("Added real_address_port column to sessions table")
             except sqlite3.OperationalError:
-                # Column already exists
                 pass
             
-            conn.execute('CREATE INDEX IF NOT EXISTS idx_username ON sessions(username)')
-            conn.execute('CREATE INDEX IF NOT EXISTS idx_server ON sessions(server_name)')
-            conn.execute('CREATE INDEX IF NOT EXISTS idx_connected ON sessions(connected_since)')
-            conn.execute('CREATE INDEX IF NOT EXISTS idx_disconnected ON sessions(disconnected_at)')
+            # Composite indexes matching actual query patterns
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_user_server ON sessions(username, server_name)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_disconnected_at ON sessions(disconnected_at)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_connected_since ON sessions(connected_since)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_server_disconnected ON sessions(server_name, disconnected_at)')
             
-            # Drop old unique index if exists
-            try:
-                conn.execute('DROP INDEX IF EXISTS idx_unique_active_session')
-            except sqlite3.OperationalError:
-                pass
+            # Drop legacy single-column indexes superseded by composites
+            for old_idx in ('idx_username', 'idx_server', 'idx_connected', 'idx_disconnected',
+                            'idx_unique_active_session'):
+                conn.execute(f'DROP INDEX IF EXISTS {old_idx}')
             
-            # Create unique index to prevent duplicate active sessions
-            # Unique key: username + server + real_address + port (allows multiple sessions from same user on different devices/ports)
             conn.execute('''
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_session_v2
                 ON sessions(username, server_name, real_address, real_address_port)
                 WHERE disconnected_at IS NULL
             ''')
             
-            # Enhanced user stats with server info
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS user_stats (
                     username TEXT NOT NULL,
@@ -200,7 +207,6 @@ class DatabaseManager:
                 )
             ''')
             
-            # Traffic history table for charts
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS traffic_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,69 +220,51 @@ class DatabaseManager:
                 )
             ''')
             
-            # Add session_key column if it doesn't exist (migration for existing databases)
             try:
                 conn.execute('ALTER TABLE traffic_history ADD COLUMN session_key TEXT')
                 logger.info("Added session_key column to traffic_history table")
             except sqlite3.OperationalError:
-                # Column already exists
                 pass
             
-            conn.execute('CREATE INDEX IF NOT EXISTS idx_traffic_time ON traffic_history(timestamp)')
-            conn.execute('CREATE INDEX IF NOT EXISTS idx_traffic_server ON traffic_history(server_name)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_traffic_server_time ON traffic_history(server_name, timestamp)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_traffic_session_key ON traffic_history(session_key)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_traffic_aggregate ON traffic_history(server_name, username, timestamp)')
+            
+            # Drop legacy single-column indexes superseded by composites
+            for old_idx in ('idx_traffic_time', 'idx_traffic_server'):
+                conn.execute(f'DROP INDEX IF EXISTS {old_idx}')
             
             conn.commit()
             logger.info(f"Database initialized at {self.db_path}")
     
     def save_session(self, session: VPNSession):
-        with sqlite3.connect(self.db_path) as conn:
-            # Check existing session by unique key (username, server, real_address, port)
-            existing = conn.execute('''
-                SELECT id FROM sessions 
-                WHERE username = ? AND server_name = ? AND real_address = ? AND real_address_port = ?
-                AND disconnected_at IS NULL
-            ''', (session.username, session.server_name, session.real_address, session.real_address_port)).fetchone()
-            
-            if existing:
-                # Update existing session
-                conn.execute('''
-                    UPDATE sessions SET
-                        bytes_received = ?,
-                        bytes_sent = ?,
-                        virtual_address = ?,
-                        disconnected_at = ?,
-                        session_duration = ?
-                    WHERE id = ?
-                ''', (
-                    session.bytes_received,
-                    session.bytes_sent,
-                    session.virtual_address,
-                    session.disconnected_at,
-                    session.duration_seconds if session.disconnected_at else None,
-                    existing[0]
-                ))
-            else:
-                # Insert new session
-                conn.execute('''
-                    INSERT INTO sessions (
-                        username, server_name, real_address, real_address_port, virtual_address,
-                        bytes_received, bytes_sent, connected_since,
-                        disconnected_at, session_duration
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    session.username,
-                    session.server_name,
-                    session.real_address,
-                    session.real_address_port,
-                    session.virtual_address,
-                    session.bytes_received,
-                    session.bytes_sent,
-                    session.connected_since,
-                    session.disconnected_at,
-                    session.duration_seconds if session.disconnected_at else None
-                ))
-            
+        with self._connect() as conn:
+            conn.execute('''
+                INSERT INTO sessions (
+                    username, server_name, real_address, real_address_port, virtual_address,
+                    bytes_received, bytes_sent, connected_since,
+                    disconnected_at, session_duration
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(username, server_name, real_address, real_address_port)
+                    WHERE disconnected_at IS NULL
+                DO UPDATE SET
+                    bytes_received = excluded.bytes_received,
+                    bytes_sent = excluded.bytes_sent,
+                    virtual_address = excluded.virtual_address,
+                    disconnected_at = excluded.disconnected_at,
+                    session_duration = excluded.session_duration
+            ''', (
+                session.username,
+                session.server_name,
+                session.real_address,
+                session.real_address_port,
+                session.virtual_address,
+                session.bytes_received,
+                session.bytes_sent,
+                session.connected_since,
+                session.disconnected_at,
+                session.duration_seconds if session.disconnected_at else None
+            ))
             conn.commit()
     
     def save_traffic_snapshot(self, server_name: str, sessions: List[VPNSession], disconnected_sessions: List[Dict] = None):
@@ -287,7 +275,7 @@ class DatabaseManager:
             sessions: List of currently active VPN sessions
             disconnected_sessions: List of sessions that were disconnected since last snapshot
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             # Build session_key -> previous traffic mapping
             prev_session_traffic = {}
             
@@ -316,17 +304,16 @@ class DatabaseManager:
             total_delta_out = 0
             active_users = len(set(s.username for s in sessions))
             
-            # Calculate deltas for each active session individually
+            session_snapshot_rows = []
+            
             for session in sessions:
                 session_key = f"{session.username}:{session.real_address}:{session.real_address_port}"
                 prev = prev_session_traffic.get(session_key)
                 
                 if prev:
-                    # Existing session - calculate delta
                     if session.bytes_received >= prev['bytes_in']:
                         delta_in = session.bytes_received - prev['bytes_in']
                     else:
-                        # Counter reset (reconnection with same key but new session)
                         delta_in = session.bytes_received
                         logger.info(f"[{server_name}] Counter reset detected for {session.username} "
                                    f"(IN: {prev['bytes_in']} -> {session.bytes_received})")
@@ -338,19 +325,21 @@ class DatabaseManager:
                         logger.info(f"[{server_name}] Counter reset detected for {session.username} "
                                    f"(OUT: {prev['bytes_out']} -> {session.bytes_sent})")
                 else:
-                    # New session - first snapshot, use current values as delta
-                    # This assumes the session just started or it's a new session we haven't seen
-                    delta_in = session.bytes_received
-                    delta_out = session.bytes_sent
+                    delta_in = 0
+                    delta_out = 0
                 
                 total_delta_in += delta_in
                 total_delta_out += delta_out
                 
-                # Save current session traffic for next snapshot comparison
-                conn.execute('''
+                session_snapshot_rows.append(
+                    (server_name, session.username, session_key, session.bytes_received, session.bytes_sent, 0)
+                )
+            
+            if session_snapshot_rows:
+                conn.executemany('''
                     INSERT INTO traffic_history (server_name, username, session_key, bytes_in, bytes_out, active_users)
-                    VALUES (?, ?, ?, ?, ?, 0)
-                ''', (server_name, session.username, session_key, session.bytes_received, session.bytes_sent))
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', session_snapshot_rows)
             
             # Account for traffic from disconnected sessions (final traffic that wasn't counted yet)
             if disconnected_sessions:
@@ -392,46 +381,29 @@ class DatabaseManager:
             conn.commit()
     
     def update_user_stats(self, username: str, server_name: str):
-        with sqlite3.connect(self.db_path) as conn:
-            # Calculate sessions by period
+        with self._connect() as conn:
             today = datetime.now().strftime('%Y-%m-%d')
             week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
             
-            # Total stats
             stats = conn.execute('''
                 SELECT 
                     COUNT(*) as total_sessions,
-                    SUM(CASE 
-                        WHEN session_duration IS NOT NULL THEN session_duration
+                    COALESCE(SUM(
+                        CASE WHEN session_duration IS NOT NULL THEN session_duration
                         ELSE strftime('%s', 'now') - strftime('%s', connected_since)
-                    END) as total_time,
-                    SUM(bytes_sent) as total_sent,
-                    SUM(bytes_received) as total_received,
-                    MAX(COALESCE(disconnected_at, connected_since)) as last_seen
+                        END
+                    ), 0) as total_time,
+                    COALESCE(SUM(bytes_sent), 0) as total_sent,
+                    COALESCE(SUM(bytes_received), 0) as total_received,
+                    MAX(COALESCE(disconnected_at, connected_since)) as last_seen,
+                    SUM(CASE WHEN disconnected_at IS NULL THEN 1 ELSE 0 END) as online_count,
+                    SUM(CASE WHEN DATE(connected_since) = ? THEN 1 ELSE 0 END) as sessions_today,
+                    SUM(CASE WHEN connected_since >= ? THEN 1 ELSE 0 END) as sessions_week
                 FROM sessions
                 WHERE username = ? AND server_name = ?
-            ''', (username, server_name)).fetchone()
-            
-            # Sessions today
-            sessions_today = conn.execute('''
-                SELECT COUNT(*) FROM sessions
-                WHERE username = ? AND server_name = ? 
-                AND DATE(connected_since) = ?
-            ''', (username, server_name, today)).fetchone()[0]
-            
-            # Sessions this week
-            sessions_week = conn.execute('''
-                SELECT COUNT(*) FROM sessions
-                WHERE username = ? AND server_name = ? 
-                AND connected_since >= ?
-            ''', (username, server_name, week_ago)).fetchone()[0]
+            ''', (today, week_ago, username, server_name)).fetchone()
             
             if stats and stats[0] > 0:
-                online = conn.execute('''
-                    SELECT COUNT(*) FROM sessions
-                    WHERE username = ? AND server_name = ? AND disconnected_at IS NULL
-                ''', (username, server_name)).fetchone()[0] > 0
-                
                 conn.execute('''
                     INSERT OR REPLACE INTO user_stats (
                         username, server_name, total_sessions, total_time_seconds,
@@ -439,27 +411,14 @@ class DatabaseManager:
                         last_seen, current_status, updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ''', (
-                    username,
-                    server_name,
-                    stats[0],
-                    stats[1] or 0,
-                    stats[2] or 0,
-                    stats[3] or 0,
-                    stats[4],
-                    'online' if online else 'offline'
+                    username, server_name,
+                    stats[0], stats[1], stats[2], stats[3], stats[4],
+                    'online' if stats[5] > 0 else 'offline'
                 ))
-                
                 conn.commit()
-                
-                # Return session stats for use in aggregated queries
-                return {
-                    'total': stats[0],
-                    'today': sessions_today,
-                    'week': sessions_week
-                }
     
     def get_active_sessions(self, server_name: Optional[str] = None) -> List[Dict]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             
             if server_name:
@@ -477,32 +436,63 @@ class DatabaseManager:
             
             return [dict(row) for row in rows]
     
-    def get_user_stats(self, server_name: Optional[str] = None, limit: int = 50) -> List[Dict]:
-        with sqlite3.connect(self.db_path) as conn:
+    def get_user_stats(self, server_name: Optional[str] = None, limit: int = 50,
+                       offset: int = 0, search: str = '') -> Tuple[List[Dict], int]:
+        """Returns (list_of_stats, total_count)"""
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             
             today = datetime.now().strftime('%Y-%m-%d')
             week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
             
+            search_filter = ""
+            search_params: list = []
+            if search:
+                search_filter = " AND us.username LIKE ?"
+                search_params = [f"%{search}%"]
+            
             if server_name:
-                # Single server - get stats with session counts by period
-                rows = conn.execute('''
+                count_row = conn.execute(f'''
+                    SELECT COUNT(*) FROM user_stats us
+                    WHERE us.server_name = ? {search_filter}
+                ''', [server_name] + search_params).fetchone()
+                total_count = count_row[0] if count_row else 0
+                
+                rows = conn.execute(f'''
+                    WITH session_counts AS (
+                        SELECT username, server_name,
+                            SUM(CASE WHEN DATE(connected_since) = ? THEN 1 ELSE 0 END) as sessions_today,
+                            SUM(CASE WHEN connected_since >= ? THEN 1 ELSE 0 END) as sessions_week
+                        FROM sessions
+                        WHERE server_name = ?
+                        GROUP BY username, server_name
+                    )
                     SELECT 
                         us.*,
-                        (SELECT COUNT(*) FROM sessions s 
-                         WHERE s.username = us.username AND s.server_name = us.server_name 
-                         AND DATE(s.connected_since) = ?) as sessions_today,
-                        (SELECT COUNT(*) FROM sessions s 
-                         WHERE s.username = us.username AND s.server_name = us.server_name 
-                         AND s.connected_since >= ?) as sessions_week
+                        COALESCE(sc.sessions_today, 0) as sessions_today,
+                        COALESCE(sc.sessions_week, 0) as sessions_week
                     FROM user_stats us
-                    WHERE us.server_name = ?
+                    LEFT JOIN session_counts sc 
+                        ON us.username = sc.username AND us.server_name = sc.server_name
+                    WHERE us.server_name = ? {search_filter}
                     ORDER BY us.current_status DESC, us.last_seen DESC
-                    LIMIT ?
-                ''', (today, week_ago, server_name, limit)).fetchall()
+                    LIMIT ? OFFSET ?
+                ''', [today, week_ago, server_name, server_name] + search_params + [limit, offset]).fetchall()
             else:
-                # All servers - aggregate stats
-                rows = conn.execute('''
+                count_row = conn.execute(f'''
+                    SELECT COUNT(DISTINCT us.username) FROM user_stats us
+                    WHERE 1=1 {search_filter}
+                ''', search_params).fetchone()
+                total_count = count_row[0] if count_row else 0
+                
+                rows = conn.execute(f'''
+                    WITH session_counts AS (
+                        SELECT username,
+                            SUM(CASE WHEN DATE(connected_since) = ? THEN 1 ELSE 0 END) as sessions_today,
+                            SUM(CASE WHEN connected_since >= ? THEN 1 ELSE 0 END) as sessions_week
+                        FROM sessions
+                        GROUP BY username
+                    )
                     SELECT 
                         us.username,
                         GROUP_CONCAT(DISTINCT us.server_name) as servers,
@@ -512,29 +502,24 @@ class DatabaseManager:
                         SUM(us.total_bytes_received) as total_bytes_received,
                         MAX(us.last_seen) as last_seen,
                         MAX(us.current_status) as current_status,
-                        (SELECT COUNT(*) FROM sessions s 
-                         WHERE s.username = us.username 
-                         AND DATE(s.connected_since) = ?) as sessions_today,
-                        (SELECT COUNT(*) FROM sessions s 
-                         WHERE s.username = us.username 
-                         AND s.connected_since >= ?) as sessions_week
+                        COALESCE(sc.sessions_today, 0) as sessions_today,
+                        COALESCE(sc.sessions_week, 0) as sessions_week
                     FROM user_stats us
+                    LEFT JOIN session_counts sc ON us.username = sc.username
+                    WHERE 1=1 {search_filter}
                     GROUP BY us.username
                     ORDER BY current_status DESC, last_seen DESC
-                    LIMIT ?
-                ''', (today, week_ago, limit)).fetchall()
+                    LIMIT ? OFFSET ?
+                ''', [today, week_ago] + search_params + [limit, offset]).fetchall()
             
-            return [dict(row) for row in rows]
+            return [dict(row) for row in rows], total_count
     
-    def get_traffic_history(self, hours: int = 24, server_name: Optional[str] = None) -> Dict:
+    def get_traffic_history(self, hours: float = 24, server_name: Optional[str] = None) -> Dict:
         """Get traffic history for charts"""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             since = datetime.now() - timedelta(hours=hours)
             
-            if hours <= 0.5:
-                interval_format = '%Y-%m-%d %H:%M'
-                interval_name = 'minute'
-            elif hours <= 6:
+            if hours <= 6:
                 interval_format = '%Y-%m-%d %H:%M'
                 interval_name = 'minute'
             elif hours <= 24:
@@ -545,7 +530,7 @@ class DatabaseManager:
                 interval_name = 'day'
             
             if server_name:
-                query = f'''
+                rows = conn.execute(f'''
                     SELECT 
                         strftime('{interval_format}', timestamp) as time_slot,
                         SUM(bytes_in) as total_in,
@@ -554,59 +539,41 @@ class DatabaseManager:
                     FROM traffic_history
                     WHERE timestamp > ? AND server_name = ? AND username IS NULL
                     GROUP BY time_slot
+                    HAVING time_slot IS NOT NULL
                     ORDER BY time_slot
-                '''
-                params = (since, server_name)
+                ''', (since, server_name)).fetchall()
             else:
-                query = f'''
+                rows_raw = conn.execute(f'''
                     SELECT 
                         strftime('{interval_format}', timestamp) as time_slot,
-                        server_name,
                         SUM(bytes_in) as total_in,
                         SUM(bytes_out) as total_out,
-                        MAX(active_users) as users
+                        SUM(active_users) as users
                     FROM traffic_history
                     WHERE timestamp > ? AND username IS NULL
-                    GROUP BY time_slot, server_name
+                    GROUP BY time_slot
                     HAVING time_slot IS NOT NULL
-                '''
-                params = (since,)
-                
-                rows_raw = conn.execute(query, params).fetchall()
-                
-                aggregated = {}
-                for row in rows_raw:
-                    time_slot = row[0]
-                    if time_slot not in aggregated:
-                        aggregated[time_slot] = {'in': 0, 'out': 0, 'users': 0}
-                    aggregated[time_slot]['in'] += (row[2] or 0)
-                    aggregated[time_slot]['out'] += (row[3] or 0)
-                    aggregated[time_slot]['users'] += (row[4] or 0)
-                
-                rows = [(k, v['in'], v['out'], v['users']) for k, v in sorted(aggregated.items())]
+                    ORDER BY time_slot
+                ''', (since,)).fetchall()
+                rows = rows_raw
             
-            if server_name:
-                rows = conn.execute(query, params).fetchall()
+            valid_rows = [row for row in rows if row[0]]
             
             labels = []
-            for row in rows:
+            for row in valid_rows:
                 time_str = row[0]
-                if not time_str:
-                    continue
-                if interval_name == 'hour':
-                    labels.append(time_str.split(' ')[1] if ' ' in time_str else time_str)
-                elif interval_name == 'minute':
+                if interval_name in ('hour', 'minute'):
                     labels.append(time_str.split(' ')[1] if ' ' in time_str else time_str)
                 else:
                     labels.append(time_str)
             
-            logger.debug(f"Traffic history: {len(rows)} data points, server={server_name}, hours={hours}")
+            logger.debug(f"Traffic history: {len(valid_rows)} data points, server={server_name}, hours={hours}")
             
             return {
                 'labels': labels,
-                'inbound': [row[1] / (1024**3) if row[1] else 0 for row in rows],
-                'outbound': [row[2] / (1024**3) if row[2] else 0 for row in rows],
-                'users': [int(row[3]) if row[3] else 0 for row in rows]
+                'inbound': [row[1] / (1024**3) if row[1] else 0 for row in valid_rows],
+                'outbound': [row[2] / (1024**3) if row[2] else 0 for row in valid_rows],
+                'users': [int(row[3]) if row[3] else 0 for row in valid_rows]
             }
     
     def get_user_traffic_history(self, usernames: List[str], hours: float = 24, 
@@ -623,10 +590,9 @@ class DatabaseManager:
         Returns:
             Dict with labels and datasets for each user
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             since = datetime.now() - timedelta(hours=hours)
             
-            # Determine time interval based on period
             if hours <= 1:
                 interval_format = '%Y-%m-%d %H:%M'
                 interval_name = 'minute'
@@ -719,15 +685,13 @@ class DatabaseManager:
                             time_slot_deltas[time_slot] = {'in': 0, 'out': 0}
                         
                         if i == 0:
-                            # First point for this session - use as delta (new session)
-                            delta_in = dp['bytes_in']
-                            delta_out = dp['bytes_out']
+                            # First point - baseline only, delta is 0
+                            delta_in = 0
+                            delta_out = 0
                         else:
-                            # Calculate delta from previous
                             if dp['bytes_in'] >= prev_in:
                                 delta_in = dp['bytes_in'] - prev_in
                             else:
-                                # Counter reset
                                 delta_in = dp['bytes_in']
                             
                             if dp['bytes_out'] >= prev_out:
@@ -768,7 +732,7 @@ class DatabaseManager:
     
     def get_user_sessions_list(self, username: str, server_name: Optional[str] = None) -> List[Dict]:
         """Get list of sessions for a user (active and recent)"""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             
             params = [username]
@@ -831,35 +795,153 @@ class DatabaseManager:
             return sessions
     
     def cleanup_old_data(self):
-        """Remove old data based on retention policy"""
+        """Remove old data based on retention policy and recalculate user_stats"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                # Calculate cutoff dates
+            with self._connect() as conn:
                 sessions_cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
                 traffic_cutoff = datetime.now() - timedelta(days=TRAFFIC_HISTORY_RETENTION_DAYS)
                 
-                # Delete old sessions
                 sessions_deleted = conn.execute('''
                     DELETE FROM sessions 
                     WHERE disconnected_at IS NOT NULL 
                     AND disconnected_at < ?
                 ''', (sessions_cutoff,)).rowcount
                 
-                # Delete old traffic history
                 traffic_deleted = conn.execute('''
                     DELETE FROM traffic_history 
                     WHERE timestamp < ?
                 ''', (traffic_cutoff,)).rowcount
                 
+                # Delete per-session traffic snapshots older than 2 hours
+                # (only the latest snapshot per server is needed for delta calculation;
+                # aggregate rows with username IS NULL are kept for charts)
+                old_snapshots_deleted = conn.execute('''
+                    DELETE FROM traffic_history
+                    WHERE session_key IS NOT NULL
+                    AND timestamp < datetime('now', '-2 hours')
+                ''').rowcount
+                
+                if old_snapshots_deleted > 0:
+                    logger.info(f"Cleanup: Removed {old_snapshots_deleted} old per-session snapshots")
+                
+                # Remove user_stats entries for users with no remaining sessions
+                stale_stats_deleted = conn.execute('''
+                    DELETE FROM user_stats
+                    WHERE (username, server_name) NOT IN (
+                        SELECT DISTINCT username, server_name FROM sessions
+                    )
+                ''').rowcount
+                
+                # Recalculate user_stats aggregates from remaining sessions
+                if sessions_deleted > 0:
+                    conn.execute('''
+                        UPDATE user_stats SET
+                            total_sessions = (
+                                SELECT COUNT(*) FROM sessions s
+                                WHERE s.username = user_stats.username 
+                                AND s.server_name = user_stats.server_name
+                            ),
+                            total_time_seconds = (
+                                SELECT COALESCE(SUM(
+                                    CASE WHEN s.session_duration IS NOT NULL THEN s.session_duration
+                                    ELSE strftime('%s', 'now') - strftime('%s', s.connected_since)
+                                    END
+                                ), 0) FROM sessions s
+                                WHERE s.username = user_stats.username 
+                                AND s.server_name = user_stats.server_name
+                            ),
+                            total_bytes_sent = (
+                                SELECT COALESCE(SUM(s.bytes_sent), 0) FROM sessions s
+                                WHERE s.username = user_stats.username 
+                                AND s.server_name = user_stats.server_name
+                            ),
+                            total_bytes_received = (
+                                SELECT COALESCE(SUM(s.bytes_received), 0) FROM sessions s
+                                WHERE s.username = user_stats.username 
+                                AND s.server_name = user_stats.server_name
+                            ),
+                            updated_at = CURRENT_TIMESTAMP
+                    ''')
+                
                 conn.commit()
                 
-                if sessions_deleted > 0 or traffic_deleted > 0:
-                    logger.info(f"Cleanup: Removed {sessions_deleted} old sessions and {traffic_deleted} traffic records")
+                if sessions_deleted > 0 or traffic_deleted > 0 or stale_stats_deleted > 0:
+                    logger.info(f"Cleanup: Removed {sessions_deleted} sessions, "
+                              f"{traffic_deleted} traffic records, "
+                              f"{stale_stats_deleted} stale user_stats entries")
                     
                 return sessions_deleted, traffic_deleted
         except Exception as e:
             logger.error(f"Error during data cleanup: {e}")
             return 0, 0
+
+    def get_users_list(self, server_name: Optional[str] = None) -> List[Dict]:
+        """Get list of all users with online status"""
+        with self._connect() as conn:
+            params: list = []
+            server_filter = ""
+            if server_name:
+                server_filter = "WHERE server_name = ?"
+                params.append(server_name)
+            
+            rows = conn.execute(f'''
+                SELECT DISTINCT username, 
+                       MAX(CASE WHEN disconnected_at IS NULL THEN 1 ELSE 0 END) as is_online
+                FROM sessions
+                {server_filter}
+                GROUP BY username
+                ORDER BY is_online DESC, username
+            ''', params).fetchall()
+            
+            return [{'username': r[0], 'is_online': bool(r[1])} for r in rows]
+    
+    def get_summary(self, server_name: Optional[str] = None, period: str = 'all') -> Dict:
+        """Get dashboard summary statistics"""
+        with self._connect() as conn:
+            today = datetime.now().strftime('%Y-%m-%d')
+            server_filter = " AND server_name = ?" if server_name else ""
+            
+            summary_params: list = [today]
+            if server_name:
+                summary_params.append(server_name)
+            
+            row = conn.execute(f'''
+                SELECT
+                    COUNT(DISTINCT CASE WHEN disconnected_at IS NULL THEN username END),
+                    COUNT(DISTINCT username),
+                    SUM(CASE WHEN DATE(connected_since) = ? THEN 1 ELSE 0 END),
+                    COUNT(DISTINCT server_name)
+                FROM sessions
+                WHERE 1=1 {server_filter}
+            ''', summary_params).fetchone()
+            
+            traffic_period_filter = ""
+            traffic_params: list = []
+            if server_name:
+                traffic_params.append(server_name)
+            if period == 'day':
+                traffic_period_filter = " AND DATE(connected_since) = ?"
+                traffic_params.append(today)
+            elif period in ('week', 'month'):
+                days = 7 if period == 'week' else 30
+                traffic_period_filter = " AND connected_since >= ?"
+                traffic_params.append(
+                    (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+                )
+            
+            total_traffic = conn.execute(f'''
+                SELECT COALESCE(SUM(bytes_sent + bytes_received), 0)
+                FROM sessions
+                WHERE 1=1 {server_filter} {traffic_period_filter}
+            ''', traffic_params).fetchone()[0]
+            
+            return {
+                'active_users': row[0] or 0,
+                'total_users': row[1] or 0,
+                'today_sessions': row[2] or 0,
+                'total_traffic': total_traffic,
+                'server_count': row[3] or 0
+            }
 
 # OpenVPN Parser for version 2.5.x
 class OpenVPNParser:
@@ -1060,9 +1142,9 @@ class MultiServerStatsCollector:
                 logger.error(f"[{server_name}] Error processing server: {e}")
                 continue
         
-        # Periodic cleanup (every 24 hours = 1440 minutes, assuming 60s interval = 1440 iterations)
         self.cleanup_counter += 1
-        if self.cleanup_counter >= 1440:  # Once per day
+        cleanup_threshold = max(1, 86400 // UPDATE_INTERVAL)
+        if self.cleanup_counter >= cleanup_threshold:
             logger.info("Running periodic data cleanup...")
             self.db.cleanup_old_data()
             self.cleanup_counter = 0
@@ -1084,7 +1166,10 @@ class MultiServerStatsCollector:
 
 # Flask Application
 app = Flask(__name__)
-CORS(app)
+if CORS_ORIGINS:
+    CORS(app, origins=[o.strip() for o in CORS_ORIGINS.split(",") if o.strip()])
+else:
+    CORS(app, origins=[])
 
 db = DatabaseManager(DB_PATH)
 
@@ -1105,7 +1190,7 @@ def api_login():
     data = request.get_json() or {}
     token = data.get('token', '').strip()
     
-    if token == AUTH_TOKEN:
+    if hmac.compare_digest(token, AUTH_TOKEN):
         return jsonify({'success': True, 'message': 'Authentication successful'})
     else:
         return jsonify({'success': False, 'message': 'Invalid token'}), 401
@@ -1172,23 +1257,18 @@ def api_user_stats():
     search = request.args.get('search', '').strip()
     
     try:
-        stats = db.get_user_stats(server, limit + offset)
-        
-        # Apply search filter if provided
-        if search:
-            stats = [s for s in stats if search.lower() in s['username'].lower()]
-        
-        # Apply pagination
-        total_count = len(stats)
-        stats = stats[offset:offset + limit]
+        stats, total_count = db.get_user_stats(server, limit, offset, search)
         
         formatted_stats = []
         for s in stats:
-            hours = s['total_time_seconds'] // 3600
-            minutes = (s['total_time_seconds'] % 3600) // 60
+            total_time = s['total_time_seconds'] or 0
+            hours = total_time // 3600
+            minutes = (total_time % 3600) // 60
             time_str = f"{hours}h {minutes}m"
             
-            total_bytes = s['total_bytes_sent'] + s['total_bytes_received']
+            bytes_sent = s['total_bytes_sent'] or 0
+            bytes_received = s['total_bytes_received'] or 0
+            total_bytes = bytes_sent + bytes_received
             traffic_gb = round(total_bytes / (1024**3), 2)
             
             formatted_stat = {
@@ -1200,16 +1280,15 @@ def api_user_stats():
                 'total_traffic_gb': traffic_gb,
                 'last_seen': s['last_seen'],
                 'status': s['current_status'],
-                'bytes_sent': s['total_bytes_sent'],
-                'bytes_received': s['total_bytes_received'],
-                'download_gb': round(s['total_bytes_received'] / (1024**3), 2),
-                'upload_gb': round(s['total_bytes_sent'] / (1024**3), 2)
+                'bytes_sent': bytes_sent,
+                'bytes_received': bytes_received,
+                'download_gb': round(bytes_received / (1024**3), 2),
+                'upload_gb': round(bytes_sent / (1024**3), 2)
             }
             
-            # Add server info if aggregated
-            if 'servers' in s:
+            if 'servers' in s and s['servers']:
                 formatted_stat['servers'] = s['servers']
-            elif 'server_name' in s:
+            elif 'server_name' in s and s['server_name']:
                 formatted_stat['server_name'] = s['server_name']
             
             formatted_stats.append(formatted_stat)
@@ -1321,26 +1400,7 @@ def api_users_list():
     server = request.args.get('server')
     
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            if server:
-                rows = conn.execute('''
-                    SELECT DISTINCT username, 
-                           MAX(CASE WHEN disconnected_at IS NULL THEN 1 ELSE 0 END) as is_online
-                    FROM sessions 
-                    WHERE server_name = ?
-                    GROUP BY username
-                    ORDER BY is_online DESC, username
-                ''', (server,)).fetchall()
-            else:
-                rows = conn.execute('''
-                    SELECT DISTINCT username,
-                           MAX(CASE WHEN disconnected_at IS NULL THEN 1 ELSE 0 END) as is_online
-                    FROM sessions
-                    GROUP BY username
-                    ORDER BY is_online DESC, username
-                ''').fetchall()
-            
-            return jsonify([{'username': r[0], 'is_online': bool(r[1])} for r in rows])
+        return jsonify(db.get_users_list(server))
     except Exception as e:
         logger.error(f"Error fetching users list: {e}")
         return jsonify({'error': str(e)}), 500
@@ -1349,90 +1409,11 @@ def api_users_list():
 @require_auth
 def api_summary():
     server = request.args.get('server')
-    period = request.args.get('period', 'all')  # day, week, month, all
+    period = request.args.get('period', 'all')
     
-    # Calculate date filter based on period
-    date_filter = None
-    if period == 'day':
-        date_filter = datetime.now().strftime('%Y-%m-%d')
-    elif period == 'week':
-        date_filter = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
-    elif period == 'month':
-        date_filter = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d %H:%M:%S')
+    summary = db.get_summary(server, period)
+    traffic_gb = round(summary['total_traffic'] / (1024**3), 2)
     
-    with sqlite3.connect(DB_PATH) as conn:
-        if server:
-            active_users = conn.execute(
-                "SELECT COUNT(DISTINCT username) FROM sessions WHERE disconnected_at IS NULL AND server_name = ?",
-                (server,)
-            ).fetchone()[0]
-            
-            total_users = conn.execute(
-                "SELECT COUNT(DISTINCT username) FROM sessions WHERE server_name = ?",
-                (server,)
-            ).fetchone()[0]
-            
-            today = datetime.now().strftime('%Y-%m-%d')
-            today_sessions = conn.execute(
-                "SELECT COUNT(*) FROM sessions WHERE DATE(connected_since) = ? AND server_name = ?",
-                (today, server)
-            ).fetchone()[0]
-            
-            # Traffic with period filter
-            if period == 'day':
-                total_traffic = conn.execute(
-                    "SELECT SUM(bytes_sent + bytes_received) FROM sessions WHERE server_name = ? AND DATE(connected_since) = ?",
-                    (server, date_filter)
-                ).fetchone()[0] or 0
-            elif period in ('week', 'month'):
-                total_traffic = conn.execute(
-                    "SELECT SUM(bytes_sent + bytes_received) FROM sessions WHERE server_name = ? AND connected_since >= ?",
-                    (server, date_filter)
-                ).fetchone()[0] or 0
-            else:
-                total_traffic = conn.execute(
-                    "SELECT SUM(bytes_sent + bytes_received) FROM sessions WHERE server_name = ?",
-                    (server,)
-                ).fetchone()[0] or 0
-        else:
-            active_users = conn.execute(
-                "SELECT COUNT(DISTINCT username) FROM sessions WHERE disconnected_at IS NULL"
-            ).fetchone()[0]
-            
-            total_users = conn.execute(
-                "SELECT COUNT(DISTINCT username) FROM sessions"
-            ).fetchone()[0]
-            
-            today = datetime.now().strftime('%Y-%m-%d')
-            today_sessions = conn.execute(
-                "SELECT COUNT(*) FROM sessions WHERE DATE(connected_since) = ?",
-                (today,)
-            ).fetchone()[0]
-            
-            # Traffic with period filter
-            if period == 'day':
-                total_traffic = conn.execute(
-                    "SELECT SUM(bytes_sent + bytes_received) FROM sessions WHERE DATE(connected_since) = ?",
-                    (date_filter,)
-                ).fetchone()[0] or 0
-            elif period in ('week', 'month'):
-                total_traffic = conn.execute(
-                    "SELECT SUM(bytes_sent + bytes_received) FROM sessions WHERE connected_since >= ?",
-                    (date_filter,)
-                ).fetchone()[0] or 0
-            else:
-                total_traffic = conn.execute(
-                    "SELECT SUM(bytes_sent + bytes_received) FROM sessions"
-                ).fetchone()[0] or 0
-        
-        traffic_gb = round(total_traffic / (1024**3), 2)
-        
-        # Get server count
-        server_count = conn.execute(
-            "SELECT COUNT(DISTINCT server_name) FROM sessions"
-        ).fetchone()[0]
-    
-    # Period label for display
     period_labels = {
         'day': 'Today',
         'week': 'Last 7 Days',
@@ -1441,11 +1422,11 @@ def api_summary():
     }
     
     return jsonify({
-        'active_users': active_users,
-        'total_users': total_users,
-        'today_sessions': today_sessions,
+        'active_users': summary['active_users'],
+        'total_users': summary['total_users'],
+        'today_sessions': summary['today_sessions'],
         'total_traffic_gb': traffic_gb,
-        'server_count': server_count,
+        'server_count': summary['server_count'],
         'traffic_period': period,
         'traffic_period_label': period_labels.get(period, 'All Time')
     })
@@ -1490,22 +1471,24 @@ def export_users():
     server = request.args.get('server')
     
     try:
-        stats = db.get_user_stats(server, MAX_LIMIT)
+        stats, _ = db.get_user_stats(server, MAX_LIMIT)
         
-        # Format data for export
         export_data = []
         for s in stats:
-            hours = s['total_time_seconds'] // 3600
-            minutes = (s['total_time_seconds'] % 3600) // 60
+            total_time = s['total_time_seconds'] or 0
+            bytes_sent = s['total_bytes_sent'] or 0
+            bytes_received = s['total_bytes_received'] or 0
+            hours = total_time // 3600
+            minutes = (total_time % 3600) // 60
             
             export_row = {
                 'username': s['username'],
                 'total_sessions': s['total_sessions'],
                 'total_time_hours': hours,
                 'total_time_minutes': minutes,
-                'total_bytes_sent': s['total_bytes_sent'],
-                'total_bytes_received': s['total_bytes_received'],
-                'total_traffic_gb': round((s['total_bytes_sent'] + s['total_bytes_received']) / (1024**3), 2),
+                'total_bytes_sent': bytes_sent,
+                'total_bytes_received': bytes_received,
+                'total_traffic_gb': round((bytes_sent + bytes_received) / (1024**3), 2),
                 'last_seen': s['last_seen'],
                 'status': s['current_status']
             }
@@ -1539,7 +1522,8 @@ def export_users():
         logger.error(f"Error exporting user stats: {e}")
         return jsonify({'error': str(e)}), 500
 
-if __name__ == '__main__':
+def start_collector():
+    """Start the background stats collector thread"""
     logger.info("Starting Multi-Server OpenVPN Statistics System")
     logger.info(f"Database: {DB_PATH}")
     logger.info(f"Update interval: {UPDATE_INTERVAL} seconds")
@@ -1549,10 +1533,13 @@ if __name__ == '__main__':
         logger.info(f"  - {server['name']}: {server['status_file']}")
     logger.info("="*60)
     
-    # Start stats collector in background thread
     collector = MultiServerStatsCollector()
     collector_thread = threading.Thread(target=collector.run, daemon=True)
     collector_thread.start()
-    
-    # Run Flask
+    return collector
+
+# Start collector on module load (works with both gunicorn and direct run)
+_collector = start_collector()
+
+if __name__ == '__main__':
     app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False)

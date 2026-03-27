@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
 COPY app.py .
+COPY migrate.py .
 COPY templates/ ./templates/
 COPY static/ ./static/
 
@@ -34,5 +35,6 @@ EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:5000/api/health || exit 1
 
-# Run the application
-CMD ["python", "app.py"]
+# Single worker + threads: SQLite doesn't support multi-process writes,
+# and the background collector must run in exactly one process
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "4", "--timeout", "120", "app:app"]

@@ -931,11 +931,13 @@
             $('#usersChartTitle').html(`👥 Active Users Over Time (${timeLabel})`);
         }
         
-        // Export data
+        // Export data (pass token as query param since window.location doesn't send headers)
         function exportData(type, format) {
-            const server = currentServer ? `?server=${currentServer}` : '';
-            const url = `/api/export/${type}${server}${server ? '&' : '?'}format=${format}`;
-            window.location.href = url;
+            const params = new URLSearchParams();
+            if (currentServer) params.set('server', currentServer);
+            params.set('format', format);
+            if (authToken) params.set('token', authToken);
+            window.location.href = `/api/export/${type}?${params.toString()}`;
         }
         
         // Sorting functions

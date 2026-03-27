@@ -287,19 +287,20 @@
             }
         });
         
-        // Check if already logged in
+        // Check if already logged in using a protected endpoint
         window.addEventListener('DOMContentLoaded', async () => {
             const token = localStorage.getItem('auth_token');
             if (token) {
-                // Verify token
                 try {
-                    const response = await fetch('/api/health', {
+                    const response = await fetch('/api/servers', {
                         headers: {
                             'Authorization': 'Bearer ' + token
                         }
                     });
                     if (response.ok) {
                         window.location.href = '/';
+                    } else {
+                        localStorage.removeItem('auth_token');
                     }
                 } catch (e) {
                     // Token invalid, stay on login page

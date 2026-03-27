@@ -9,23 +9,20 @@ services:
       - /var/log/openvpn:/var/log/openvpn:ro
       - ./data:/app/data
     environment:
-      - FLASK_ENV=production
-      - DB_PATH=/app/data/openvpn_stats.db
-      - UPDATE_INTERVAL=60
-      - SERVERS_CONFIG=
-          office:/var/log/openvpn/status-openvpn.log:/var/log/openvpn/status-openvpn.log;
-          office-full:/var/log/openvpn/status-openvpn-full.log:/var/log/openvpn/status-openvpn-full.log
-      # Authentication (recommended for production)
-      - AUTH_ENABLED=true                   # Включить авторизацию
-      - AUTH_TOKEN=                         # Укажите свой токен здесь! (например: python3 -c "import secrets; print(secrets.token_urlsafe(32))")
-      # Data retention
-      - RETENTION_DAYS=90                    # Хранение сессий
-      - TRAFFIC_HISTORY_RETENTION_DAYS=30   # Хранение трафика
-      - DEFAULT_LIMIT=50                    # Лимит по умолчанию
-      - MAX_LIMIT=500                       # Максимальный лимит
-
-#      - OPENVPN_STATUS_FILE=/var/log/openvpn/status-openvpn.log
-#      - OPENVPN_LOG_FILE=/var/log/openvpn/server-openvpn.log
+      FLASK_ENV: production
+      DB_PATH: /app/data/openvpn_stats.db
+      UPDATE_INTERVAL: "60"
+      SERVERS_CONFIG: "office:/var/log/openvpn/status-openvpn.log:/var/log/openvpn/status-openvpn.log;office-full:/var/log/openvpn/status-openvpn-full.log:/var/log/openvpn/status-openvpn-full.log"
+      # Авторизация
+      AUTH_ENABLED: "true"
+      AUTH_TOKEN: ""  # Укажите токен: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+      # Хранение данных
+      RETENTION_DAYS: "90"
+      TRAFFIC_HISTORY_RETENTION_DAYS: "30"
+      DEFAULT_LIMIT: "50"
+      MAX_LIMIT: "500"
+      # CORS (по умолчанию — same-origin only)
+      # CORS_ORIGINS: "https://example.com,https://other.com"
     networks:
       - openvpn-stats-net
     healthcheck:
@@ -51,3 +48,7 @@ services:
       - openvpn-stats
     networks:
       - openvpn-stats-net
+
+networks:
+  openvpn-stats-net:
+    driver: bridge

@@ -1,4 +1,4 @@
-.PHONY: help build up down restart logs clean shell
+.PHONY: help build up down restart logs clean shell migrate
 
 help:
 	@echo "OpenVPN Statistics Docker Management"
@@ -10,6 +10,7 @@ help:
 	@echo "make logs     - View logs"
 	@echo "make clean    - Clean up data"
 	@echo "make shell    - Enter container shell"
+	@echo "make migrate  - Run one-time DB migration"
 
 build:
 	docker compose build --no-cache
@@ -32,6 +33,9 @@ clean:
 
 shell:
 	docker exec -it openvpn-stats /bin/bash
+
+migrate:
+	docker exec -it openvpn-stats python migrate.py
 
 tail-logs:
 	docker compose logs -f --tail=100
