@@ -58,8 +58,45 @@ def migrate():
     print(f"\nsessions: {total_sessions} total ({active_sessions} active)")
     print(f"user_stats: {user_stats_rows} rows")
 
-    # --- Step 2: Purge old per-session snapshots ---
-    # Keep only the latest batch per server (needed for next delta calculation)
+    # --- Step 2: Fix ghost sessions from UPSERT bug ---
+    # The UPSERT bug created duplicate rows: original active session was never closed,
+    # and a new "disconnected" duplicate was inserted alongside it.
+    print("\n--- Fixing ghost sessions from UPSERT bug ---")
+
+    # Find and remove duplicate disconnected rows that were created by the bug
+    # (rows where there's both an active and a disconnected version for the same key)
+    ghost_duplicates = conn.execute('''
+        DELETE FROM sessions
+        WHERE disconnected_at IS NOT NULL
+        AND id IN (
+            SELECT d.id FROM sessions d
+            INNER JOIN sessions a ON 
+                d.username = a.username 
+                AND d.server_name = a.server_name
+                AND d.real_address = a.real_address
+                AND d.real_address_port = a.real_address_port
+            WHERE d.disconnected_at IS NOT NULL
+            AND a.disconnected_at IS NULL
+            AND d.bytes_received <= a.bytes_received
+            AND d.bytes_sent <= a.bytes_sent
+        )
+    ''').rowcount
+    print(f"  Removed {ghost_duplicates} duplicate disconnected rows")
+
+    # Now properly close sessions that should have been closed
+    # (sessions marked as active in DB but not actually active on OpenVPN)
+    # This can't be automated here since we don't have access to the status file.
+    # The collector will handle it on the next cycle.
+
+    stale_active = conn.execute('''
+        SELECT COUNT(*) FROM sessions
+        WHERE disconnected_at IS NULL
+    ''').fetchone()[0]
+    print(f"  Currently active sessions in DB: {stale_active}")
+    print(f"  (Stale ones will be auto-closed by the collector on the next cycle)")
+    conn.commit()
+
+    # --- Step 3: Purge old per-session snapshots ---
     print("\n--- Purging old per-session snapshots ---")
 
     # For each server, find the latest timestamp and keep only those rows
@@ -100,7 +137,7 @@ def migrate():
     conn.commit()
     print(f"  Deleted: {deleted} rows, kept: {kept}")
 
-    # --- Step 3: Remove orphaned user_stats ---
+    # --- Step 4: Remove orphaned user_stats ---
     print("\n--- Cleaning orphaned user_stats ---")
     orphaned = conn.execute('''
         DELETE FROM user_stats
@@ -111,7 +148,7 @@ def migrate():
     conn.commit()
     print(f"  Removed: {orphaned} orphaned entries")
 
-    # --- Step 4: Recalculate user_stats from sessions ---
+    # --- Step 5: Recalculate user_stats from sessions ---
     print("\n--- Recalculating user_stats ---")
     conn.execute('''
         UPDATE user_stats SET
@@ -152,7 +189,7 @@ def migrate():
     conn.commit()
     print(f"  Recalculated: {updated} entries")
 
-    # --- Step 5: VACUUM ---
+    # --- Step 6: VACUUM ---
     print("\n--- Running VACUUM ---")
     conn.execute("VACUUM")
     conn.close()

@@ -239,32 +239,49 @@ class DatabaseManager:
     
     def save_session(self, session: VPNSession):
         with self._connect() as conn:
-            conn.execute('''
-                INSERT INTO sessions (
-                    username, server_name, real_address, real_address_port, virtual_address,
-                    bytes_received, bytes_sent, connected_since,
-                    disconnected_at, session_duration
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(username, server_name, real_address, real_address_port)
-                    WHERE disconnected_at IS NULL
-                DO UPDATE SET
-                    bytes_received = excluded.bytes_received,
-                    bytes_sent = excluded.bytes_sent,
-                    virtual_address = excluded.virtual_address,
-                    disconnected_at = excluded.disconnected_at,
-                    session_duration = excluded.session_duration
-            ''', (
-                session.username,
-                session.server_name,
-                session.real_address,
-                session.real_address_port,
-                session.virtual_address,
-                session.bytes_received,
-                session.bytes_sent,
-                session.connected_since,
-                session.disconnected_at,
-                session.duration_seconds if session.disconnected_at else None
-            ))
+            existing = conn.execute('''
+                SELECT id FROM sessions 
+                WHERE username = ? AND server_name = ? AND real_address = ? AND real_address_port = ?
+                AND disconnected_at IS NULL
+            ''', (session.username, session.server_name, session.real_address, session.real_address_port)).fetchone()
+            
+            if existing:
+                conn.execute('''
+                    UPDATE sessions SET
+                        bytes_received = ?,
+                        bytes_sent = ?,
+                        virtual_address = ?,
+                        disconnected_at = ?,
+                        session_duration = ?
+                    WHERE id = ?
+                ''', (
+                    session.bytes_received,
+                    session.bytes_sent,
+                    session.virtual_address,
+                    session.disconnected_at,
+                    session.duration_seconds if session.disconnected_at else None,
+                    existing[0]
+                ))
+            else:
+                conn.execute('''
+                    INSERT INTO sessions (
+                        username, server_name, real_address, real_address_port, virtual_address,
+                        bytes_received, bytes_sent, connected_since,
+                        disconnected_at, session_duration
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    session.username,
+                    session.server_name,
+                    session.real_address,
+                    session.real_address_port,
+                    session.virtual_address,
+                    session.bytes_received,
+                    session.bytes_sent,
+                    session.connected_since,
+                    session.disconnected_at,
+                    session.duration_seconds if session.disconnected_at else None
+                ))
+            
             conn.commit()
     
     def save_traffic_snapshot(self, server_name: str, sessions: List[VPNSession], disconnected_sessions: List[Dict] = None):
@@ -543,19 +560,26 @@ class DatabaseManager:
                     ORDER BY time_slot
                 ''', (since, server_name)).fetchall()
             else:
-                rows_raw = conn.execute(f'''
-                    SELECT 
-                        strftime('{interval_format}', timestamp) as time_slot,
-                        SUM(bytes_in) as total_in,
-                        SUM(bytes_out) as total_out,
-                        SUM(active_users) as users
-                    FROM traffic_history
-                    WHERE timestamp > ? AND username IS NULL
+                rows = conn.execute(f'''
+                    SELECT time_slot,
+                        SUM(total_in) as total_in,
+                        SUM(total_out) as total_out,
+                        SUM(max_users) as users
+                    FROM (
+                        SELECT 
+                            strftime('{interval_format}', timestamp) as time_slot,
+                            server_name,
+                            SUM(bytes_in) as total_in,
+                            SUM(bytes_out) as total_out,
+                            MAX(active_users) as max_users
+                        FROM traffic_history
+                        WHERE timestamp > ? AND username IS NULL
+                        GROUP BY time_slot, server_name
+                    )
                     GROUP BY time_slot
                     HAVING time_slot IS NOT NULL
                     ORDER BY time_slot
                 ''', (since,)).fetchall()
-                rows = rows_raw
             
             valid_rows = [row for row in rows if row[0]]
             
