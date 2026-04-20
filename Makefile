@@ -1,16 +1,16 @@
-.PHONY: help build up down restart logs clean shell migrate
+.PHONY: help build up down restart logs clean shell tail-logs
 
 help:
 	@echo "OpenVPN Statistics Docker Management"
 	@echo "===================================="
-	@echo "make build    - Build Docker images"
-	@echo "make up       - Start services"
-	@echo "make down     - Stop services"
-	@echo "make restart  - Restart services"
-	@echo "make logs     - View logs"
-	@echo "make clean    - Clean up data"
-	@echo "make shell    - Enter container shell"
-	@echo "make migrate  - Run one-time DB migration"
+	@echo "make build     - Build Docker images"
+	@echo "make up        - Start services"
+	@echo "make down      - Stop services"
+	@echo "make restart   - Restart services"
+	@echo "make logs      - View logs"
+	@echo "make tail-logs - Follow last 100 log lines"
+	@echo "make clean     - Clean up data"
+	@echo "make shell     - Enter container shell"
 
 build:
 	docker compose build --no-cache
@@ -33,9 +33,6 @@ clean:
 
 shell:
 	docker exec -it openvpn-stats /bin/bash
-
-migrate:
-	docker exec -it openvpn-stats python migrate.py
 
 tail-logs:
 	docker compose logs -f --tail=100

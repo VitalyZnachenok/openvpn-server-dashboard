@@ -9,16 +9,16 @@ Multi-server OpenVPN monitoring with web interface.
 
 ## Features
 
-- 🔐 **Token-based authentication**
+- 🔐 **Token-based authentication** (sent via `Authorization: Bearer …`)
 - Multi-server support
-- Traffic charts (5min-7days)
+- Traffic charts (5min – 7 days)
 - Real-time active sessions
 - User statistics with search/sort
-- 📊 **User traffic comparison** (up to 10 users on one chart)
+- 📊 **User traffic comparison** (up to 10 users on one chart, 6h/24h/7d)
 - 📋 **Session details viewer** (active and recent sessions per user)
-- CSV/JSON export
-- Multiple simultaneous sessions per user
-- Auto-cleanup
+- CSV/JSON export (full dataset, no silent truncation)
+- Multiple simultaneous sessions per user, correct handling of reconnects
+- Automatic schema migrations + retention/VACUUM
 
 ## Quick Start
 
@@ -110,9 +110,11 @@ environment:
 |----------|---------|-------------|
 | `AUTH_ENABLED` | `true` | Enable/disable authentication |
 | `AUTH_TOKEN` | (auto-generated) | Authentication token for dashboard access |
-| `UPDATE_INTERVAL` | 60 | Update interval (seconds) |
-| `RETENTION_DAYS` | 90 | Session retention (days) |
-| `TRAFFIC_HISTORY_RETENTION_DAYS` | 30 | Chart data retention (days) |
+| `UPDATE_INTERVAL` | `60` | Stats collection interval, seconds |
+| `RETENTION_DAYS` | `90` | Session retention (days) |
+| `TRAFFIC_HISTORY_RETENTION_DAYS` | `30` | Traffic chart data retention (days) |
+| `DEFAULT_LIMIT` / `MAX_LIMIT` | `50` / `500` | User-stats pagination limits (exports ignore them) |
+| `TZ` | `UTC` | Container timezone. Leave as `UTC` — all timestamps are stored and compared in UTC to match SQLite `CURRENT_TIMESTAMP`. |
 
 ## API
 
@@ -162,25 +164,38 @@ Compare traffic consumption of multiple users on a single chart.
 - Per-user statistics cards (download/upload totals)
 - Session details modal (active + recent 7 days)
 - Color-coded visualization
-- Time range selector (1h, 6h, 24h, 7d)
+- Time range selector (6h, 24h, 7d) — backed by the same retention as the main chart
 
 ## Database
 
-SQLite database with 3 tables:
-- `sessions` - VPN sessions
-- `user_stats` - Aggregated user statistics
-- `traffic_history` - Traffic deltas for charts
+SQLite database with the following tables:
 
-**Important:** Traffic stored as deltas, not accumulated values. Handles reconnections correctly.
+| Table | Purpose |
+|-------|---------|
+| `sessions` | One row per VPN session (start/end, bytes, addresses). |
+| `user_stats` | Per-user aggregate counters (sessions, time, bytes). |
+| `traffic_history` | Traffic **deltas** for charts. Aggregate rows (`username IS NULL`) drive the main chart, per-user rows drive the comparison chart. |
+| `session_traffic_state` | Last-known cumulative byte counters per active session; used to compute deltas between collection cycles. Rows are upserted every cycle and removed when a session disconnects. |
+| `schema_version` | Single-row table tracking the applied schema version (currently `2`). |
+
+**Traffic accounting.** Traffic is stored as deltas, never as cumulative values. Very short sessions are captured via a "freshly connected" heuristic (age < 2 × `UPDATE_INTERVAL`). OpenVPN counter resets and client reconnects on the same `ip:port` are detected automatically.
+
+### Upgrading
+
+Schema migrations are applied automatically on startup via `DatabaseManager._migrate`. Just pull the new image and restart — no manual steps required.
+
+The daily cleanup job also prunes orphaned `user_stats`, recomputes aggregates as sessions expire and runs `VACUUM` approximately once a week, so long-running deployments stay tidy on their own.
 
 ## Makefile
 
 ```bash
-make up        # Start
-make down      # Stop
-make restart   # Restart
-make logs      # View logs
-make clean     # Clean all data
+make up         # Start
+make down       # Stop
+make restart    # Restart
+make logs       # Follow logs
+make tail-logs  # Follow last 100 log lines
+make clean      # Remove containers and wipe data/
+make shell      # Shell into the container
 ```
 
 ## SSL (Optional)

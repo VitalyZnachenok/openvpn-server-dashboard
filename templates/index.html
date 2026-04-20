@@ -4,8 +4,15 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Multi-Server OpenVPN Statistics Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <!-- Pin exact versions of third-party libraries and use SRI where a widely
+         published hash is available so a compromised CDN can't inject code. -->
+    <script
+        src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
+        crossorigin="anonymous"></script>
+    <script
+        src="https://code.jquery.com/jquery-3.7.1.min.js"
+        integrity="sha256-/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo="
+        crossorigin="anonymous"></script>
     <style>
         :root {
             --bg-gradient-start: #667eea;
@@ -931,13 +938,46 @@
             $('#usersChartTitle').html(`👥 Active Users Over Time (${timeLabel})`);
         }
         
-        // Export data (pass token as query param since window.location doesn't send headers)
-        function exportData(type, format) {
+        // Export data via fetch + Blob so the token travels in the
+        // Authorization header (not the URL, which would end up in access logs).
+        async function exportData(type, format) {
             const params = new URLSearchParams();
             if (currentServer) params.set('server', currentServer);
             params.set('format', format);
-            if (authToken) params.set('token', authToken);
-            window.location.href = `/api/export/${type}?${params.toString()}`;
+
+            try {
+                const response = await fetch(`/api/export/${type}?${params.toString()}`, {
+                    headers: authToken ? { 'Authorization': 'Bearer ' + authToken } : {}
+                });
+
+                if (!response.ok) {
+                    if (response.status === 401) {
+                        localStorage.removeItem('auth_token');
+                        window.location.href = '/login';
+                        return;
+                    }
+                    alert('Export failed: HTTP ' + response.status);
+                    return;
+                }
+
+                const blob = await response.blob();
+                const disposition = response.headers.get('Content-Disposition') || '';
+                const match = disposition.match(/filename\*?="?([^";]+)"?/i);
+                const fallbackName = `vpn_${type}_${new Date().toISOString().replace(/[:T.]/g, '').slice(0, 15)}.${format}`;
+                const filename = match ? match[1] : fallbackName;
+
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            } catch (e) {
+                console.error('Export failed:', e);
+                alert('Export error: ' + e.message);
+            }
         }
         
         // Sorting functions
