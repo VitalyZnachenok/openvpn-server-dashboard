@@ -16,6 +16,7 @@ Multi-server OpenVPN monitoring with web interface.
 - User statistics with search/sort
 - 📊 **User traffic comparison** (up to 10 users on one chart, 6h/24h/7d)
 - 📋 **Session details viewer** (active and recent sessions per user)
+- 🔎 **OpenVPN log analysis** (optional): disconnect reasons, failed auth attempts, TLS handshake latency, renegotiation count, live event tail
 - CSV/JSON export (full dataset, no silent truncation)
 - Multiple simultaneous sessions per user, correct handling of reconnects
 - Automatic schema migrations + retention/VACUUM
@@ -37,20 +38,35 @@ Edit `docker-compose.yml`:
 **Multiple servers:**
 ```yaml
 environment:
-  - SERVERS_CONFIG=server1:/path/status.log:/path/vpn.log;server2:/path/status.log
+  # NAME:STATUS_FILE[:LOG_FILE], several servers separated by ";"
+  - SERVERS_CONFIG=office:/var/log/openvpn/status.log:/var/log/openvpn/openvpn.log;branch:/var/log/openvpn/branch-status.log:/var/log/openvpn/branch.log
 ```
 
 **Single server:**
 ```yaml
 environment:
   - OPENVPN_STATUS_FILE=/var/log/openvpn/openvpn-status.log
+  - OPENVPN_LOG_FILE=/var/log/openvpn/openvpn.log    # optional, enables log parsing
 ```
 
-### OpenVPN config
+`STATUS_FILE` is the periodic snapshot OpenVPN writes via `status` (status-version 2). `LOG_FILE` is the main log produced by `log` / `log-append` and is what the dashboard reads to detect failed authentications, disconnect reasons and TLS handshake latency. Pass the same path twice and the dashboard will refuse to parse it (the two files have different formats); leave the third field empty if you don't have / don't want to expose the log.
+
+### OpenVPN server config
+
+Required:
 ```
-status /var/log/openvpn/openvpn-status.log
-status-version 2
+status      /var/log/openvpn/openvpn-status.log
 ```
+
+The dashboard auto-detects and parses both `status-version 1` (the legacy/default OpenVPN format) and `status-version 2`. v2 carries a few extra columns (Virtual IPv6, Username, Client ID, Peer ID, Cipher); for new deployments it's slightly preferable, but keeping the default v1 also works fine.
+
+Recommended (enables the log-derived features — auth failures, disconnect reasons, TLS metrics):
+```
+log-append  /var/log/openvpn/openvpn.log
+verb        3
+```
+
+`verb 1` or `2` won't write the lines we look for; `verb 4+` is fine but produces a lot of noise. Make sure the log file is mounted read-only into the dashboard container (the example `docker-compose.yml` already mounts `/var/log/openvpn`).
 
 ## Authentication
 
@@ -114,6 +130,9 @@ environment:
 | `RETENTION_DAYS` | `90` | Session retention (days) |
 | `TRAFFIC_HISTORY_RETENTION_DAYS` | `30` | Traffic chart data retention (days) |
 | `DEFAULT_LIMIT` / `MAX_LIMIT` | `50` / `500` | User-stats pagination limits (exports ignore them) |
+| `LOG_PARSE_ENABLED` | `true` | Enable parsing of OpenVPN main log (`openvpn.log`) for auth failures / disconnect reasons / TLS metrics |
+| `LOG_PARSE_MAX_BYTES` | `10485760` | Per-cycle cap on log bytes read (sanity ceiling for huge log files after rotation) |
+| `LOG_EVENT_MATCH_WINDOW` | `180` | Seconds tolerated when associating a log event with a session row by `(server, ip, port)` |
 | `TZ` | `UTC` | Container timezone. Leave as `UTC` — all timestamps are stored and compared in UTC to match SQLite `CURRENT_TIMESTAMP`. |
 
 ## API
@@ -137,6 +156,8 @@ Authorization: Bearer YOUR_TOKEN
 - `GET /api/user_traffic_chart?users=user1,user2&hours=24` - User comparison chart data
 - `GET /api/user_sessions/<username>?server=NAME` - User sessions list
 - `GET /api/users_list?server=NAME` - All users list for dropdown
+- `GET /api/auth_failures?server=NAME&hours=24&limit=200` - Failed auth attempts (parsed from `openvpn.log`)
+- `GET /api/recent_events?server=NAME&types=auth_failure,disconnect&limit=100` - Live tail of connection events
 - `GET /api/export/sessions?format=csv` - Export sessions
 - `GET /api/export/users?format=json` - Export users
 
@@ -172,11 +193,13 @@ SQLite database with the following tables:
 
 | Table | Purpose |
 |-------|---------|
-| `sessions` | One row per VPN session (start/end, bytes, addresses). |
+| `sessions` | One row per VPN session (start/end, bytes, addresses). Schema v3 adds nullable `disconnect_reason`, `tls_handshake_ms`, `reneg_count` filled from `openvpn.log`. |
 | `user_stats` | Per-user aggregate counters (sessions, time, bytes). |
 | `traffic_history` | Traffic **deltas** for charts. Aggregate rows (`username IS NULL`) drive the main chart, per-user rows drive the comparison chart. |
 | `session_traffic_state` | Last-known cumulative byte counters per active session; used to compute deltas between collection cycles. Rows are upserted every cycle and removed when a session disconnects. |
-| `schema_version` | Single-row table tracking the applied schema version (currently `2`). |
+| `connection_events` | Append-only log of events parsed from `openvpn.log` (`auth_failure`, `verify_error`, `tls_error`, `peer_init`, `reneg`, `disconnect`, `inactivity`). Same retention as `traffic_history`. |
+| `log_parse_state` | Per-server byte offset / inode of the OpenVPN main log so parsing is incremental and survives restarts/rotation. |
+| `schema_version` | Single-row table tracking the applied schema version (currently `3`). |
 
 **Traffic accounting.** Traffic is stored as deltas, never as cumulative values. Very short sessions are captured via a "freshly connected" heuristic (age < 2 × `UPDATE_INTERVAL`). OpenVPN counter resets and client reconnects on the same `ip:port` are detected automatically.
 

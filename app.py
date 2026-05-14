@@ -35,7 +35,7 @@ def utcnow() -> datetime:
 
 # Schema version managed via a dedicated `schema_version` table.
 # Bump when the schema changes and add a migration step in DatabaseManager._migrate.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _format_chart_labels(time_slots: List[str], interval_name: str) -> List[str]:
@@ -89,17 +89,32 @@ if AUTH_ENABLED and not AUTH_TOKEN:
     logger.warning("⚠️  Set AUTH_TOKEN environment variable to use a persistent token")
 
 # Multi-server configuration
-# Format: SERVER_NAME:STATUS_FILE:LOG_FILE
+# Format: SERVER_NAME:STATUS_FILE[:LOG_FILE]
+#   - STATUS_FILE: OpenVPN status file (status-version 2)
+#   - LOG_FILE   : OpenVPN main log written via `log` / `log-append`. Optional.
+#                  When provided, the dashboard parses it for auth failures,
+#                  disconnect reasons, TLS metrics, etc.
 SERVERS_CONFIG = os.getenv("SERVERS_CONFIG", "").split(";")
 SERVERS = []
 for config in SERVERS_CONFIG:
     if config.strip():
         parts = config.strip().split(":")
         if len(parts) >= 2:
+            log_file = parts[2] if len(parts) > 2 and parts[2] else None
+            # Reject the legacy "use status file as log file" pattern: it's
+            # a different file format and parsing it will produce only noise.
+            if log_file and log_file == parts[1]:
+                logger.warning(
+                    f"[{parts[0]}] log_file equals status_file ({log_file}); "
+                    f"this is almost certainly a misconfiguration — the OpenVPN "
+                    f"main log (configured via `log` / `log-append`) is a "
+                    f"different file. Disabling log parsing for this server."
+                )
+                log_file = None
             SERVERS.append({
                 "name": parts[0],
                 "status_file": parts[1],
-                "log_file": parts[2] if len(parts) > 2 else None
+                "log_file": log_file,
             })
 
 # Fallback to single server if no multi-config
@@ -107,8 +122,23 @@ if not SERVERS:
     SERVERS = [{
         "name": "default",
         "status_file": os.getenv("OPENVPN_STATUS_FILE", "/var/log/openvpn/openvpn-status.log"),
-        "log_file": os.getenv("OPENVPN_LOG_FILE", "/var/log/openvpn/openvpn.log")
+        "log_file": os.getenv("OPENVPN_LOG_FILE") or None,
     }]
+
+# Log-parsing toggle. When false, openvpn.log is never opened and no
+# connection_events are recorded — useful in restricted environments where the
+# log file isn't accessible to the container.
+LOG_PARSE_ENABLED = os.getenv("LOG_PARSE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+# Maximum bytes parsed per cycle from a single log file (sanity cap so a
+# huge log post-rotate doesn't lock up the collector). 10 MB is enough for
+# tens of thousands of events.
+LOG_PARSE_MAX_BYTES = int(os.getenv("LOG_PARSE_MAX_BYTES", str(10 * 1024 * 1024)))
+
+# Window (seconds) used to associate a parsed log event with an existing
+# session row by (server, ip, port). OpenVPN log timestamps and our snapshot
+# timestamps can drift by a few seconds.
+LOG_EVENT_MATCH_WINDOW = int(os.getenv("LOG_EVENT_MATCH_WINDOW", "180"))
 
 # CORS configuration
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "")
@@ -203,6 +233,9 @@ class DatabaseManager:
                     connected_since TIMESTAMP NOT NULL,
                     disconnected_at TIMESTAMP,
                     session_duration INTEGER,
+                    disconnect_reason TEXT,
+                    tls_handshake_ms INTEGER,
+                    reneg_count INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -251,6 +284,40 @@ class DatabaseManager:
                 )
             ''')
 
+            # Append-only log of significant events parsed from openvpn.log.
+            # `event_type` ∈ {auth_failure, tls_error, verify_error, disconnect,
+            #                 inactivity, peer_init, reneg}.
+            # `username` is best-effort: OpenVPN doesn't always include CN in
+            # the failing-handshake lines.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS connection_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_name TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    username TEXT,
+                    real_address TEXT,
+                    real_address_port TEXT,
+                    reason_text TEXT,
+                    raw_line TEXT,
+                    timestamp TIMESTAMP NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            # Tracks the byte offset and inode for each parsed log file so
+            # parsing is fully incremental and survives restarts. Inode change
+            # or file shrink → restart from offset 0 (logrotate).
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS log_parse_state (
+                    server_name TEXT PRIMARY KEY,
+                    log_path TEXT NOT NULL,
+                    inode INTEGER,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    offset INTEGER NOT NULL DEFAULT 0,
+                    last_parsed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
             conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_user_server ON sessions(username, server_name)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_disconnected_at ON sessions(disconnected_at)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_sessions_connected_since ON sessions(connected_since)')
@@ -270,6 +337,10 @@ class DatabaseManager:
             conn.execute('CREATE INDEX IF NOT EXISTS idx_traffic_user_time ON traffic_history(username, timestamp)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_traffic_aggregate ON traffic_history(server_name, username, timestamp)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_state_server ON session_traffic_state(server_name)')
+
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_events_server_time ON connection_events(server_name, timestamp)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_events_type_time   ON connection_events(event_type, timestamp)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_events_ip_time     ON connection_events(real_address, timestamp)')
 
             for old_idx in ('idx_traffic_time', 'idx_traffic_server', 'idx_traffic_session_key'):
                 conn.execute(f'DROP INDEX IF EXISTS {old_idx}')
@@ -314,6 +385,24 @@ class DatabaseManager:
                         f"Migration v2: removed {removed} per-session rows "
                         f"(legacy session_key column left in place)"
                     )
+
+        if from_version < 3:
+            # v3: add openvpn.log parsing — three nullable columns on `sessions`
+            # for the data we extract from the log, plus the new
+            # `connection_events` and `log_parse_state` tables (created above
+            # via CREATE TABLE IF NOT EXISTS).
+            session_cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+            for col, ddl in (
+                ('disconnect_reason', 'ALTER TABLE sessions ADD COLUMN disconnect_reason TEXT'),
+                ('tls_handshake_ms',  'ALTER TABLE sessions ADD COLUMN tls_handshake_ms INTEGER'),
+                ('reneg_count',       'ALTER TABLE sessions ADD COLUMN reneg_count INTEGER DEFAULT 0'),
+            ):
+                if col not in session_cols:
+                    try:
+                        conn.execute(ddl)
+                        logger.info(f"Migration v3: added column sessions.{col}")
+                    except sqlite3.OperationalError as e:
+                        logger.warning(f"Migration v3: could not add sessions.{col}: {e}")
     
     def save_session(self, session: VPNSession):
         """Insert or update a session row.
@@ -831,7 +920,7 @@ class DatabaseManager:
             
             # Get active sessions
             active = conn.execute(f'''
-                SELECT 
+                SELECT
                     id,
                     username,
                     server_name,
@@ -841,6 +930,9 @@ class DatabaseManager:
                     bytes_received,
                     bytes_sent,
                     connected_since,
+                    disconnect_reason,
+                    tls_handshake_ms,
+                    reneg_count,
                     'active' as status
                 FROM sessions
                 WHERE username = ? AND disconnected_at IS NULL {server_filter}
@@ -854,7 +946,7 @@ class DatabaseManager:
                 params_recent.append(server_name)
             
             recent = conn.execute(f'''
-                SELECT 
+                SELECT
                     id,
                     username,
                     server_name,
@@ -865,9 +957,12 @@ class DatabaseManager:
                     bytes_sent,
                     connected_since,
                     disconnected_at,
+                    disconnect_reason,
+                    tls_handshake_ms,
+                    reneg_count,
                     'completed' as status
                 FROM sessions
-                WHERE username = ? AND disconnected_at IS NOT NULL 
+                WHERE username = ? AND disconnected_at IS NOT NULL
                 AND disconnected_at > ? {server_filter}
                 ORDER BY disconnected_at DESC
                 LIMIT 20
@@ -913,6 +1008,13 @@ class DatabaseManager:
 
                 traffic_deleted = conn.execute('''
                     DELETE FROM traffic_history
+                    WHERE timestamp < ?
+                ''', (traffic_cutoff,)).rowcount
+
+                # connection_events follow the same retention as traffic
+                # rows — they're event-level data with similar volume.
+                events_deleted = conn.execute('''
+                    DELETE FROM connection_events
                     WHERE timestamp < ?
                 ''', (traffic_cutoff,)).rowcount
 
@@ -964,11 +1066,12 @@ class DatabaseManager:
 
                 conn.commit()
 
-                if (sessions_deleted or traffic_deleted
+                if (sessions_deleted or traffic_deleted or events_deleted
                         or stale_stats_deleted or state_deleted):
                     logger.info(
                         f"Cleanup: removed {sessions_deleted} sessions, "
                         f"{traffic_deleted} traffic rows, "
+                        f"{events_deleted} connection events, "
                         f"{state_deleted} stale state rows, "
                         f"{stale_stats_deleted} orphaned user_stats"
                     )
@@ -993,6 +1096,217 @@ class DatabaseManager:
                 conn.close()
         except Exception as e:
             logger.warning(f"VACUUM failed: {e}")
+
+    # ---- Log-parsing helpers --------------------------------------------
+
+    def get_log_parse_state(self, server_name: str) -> Optional[Dict]:
+        """Return the persisted parser state for `server_name` or None."""
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                'SELECT * FROM log_parse_state WHERE server_name = ?',
+                (server_name,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def save_log_parse_state(self, server_name: str, state: Dict):
+        """Upsert the parser state for `server_name`."""
+        with self._connect() as conn:
+            conn.execute('''
+                INSERT INTO log_parse_state
+                    (server_name, log_path, inode, size, offset, last_parsed_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(server_name) DO UPDATE SET
+                    log_path       = excluded.log_path,
+                    inode          = excluded.inode,
+                    size           = excluded.size,
+                    offset         = excluded.offset,
+                    last_parsed_at = CURRENT_TIMESTAMP
+            ''', (
+                server_name,
+                state.get('log_path'),
+                state.get('inode'),
+                state.get('size', 0),
+                state.get('offset', 0),
+            ))
+            conn.commit()
+
+    def save_log_events(self, events: List['LogEvent']):
+        """Persist parsed events and apply their side effects to `sessions`.
+
+        Side effects:
+          * `disconnect`/`inactivity` -> set sessions.disconnect_reason
+          * `peer_init` with handshake_ms -> set sessions.tls_handshake_ms
+          * `reneg` -> increment sessions.reneg_count
+        Side effects use a ±LOG_EVENT_MATCH_WINDOW seconds window to find
+        the matching session by (server, ip, port).
+        """
+        if not events:
+            return
+        with self._connect() as conn:
+            event_rows = [
+                (
+                    ev.server_name,
+                    ev.event_type,
+                    ev.username,
+                    ev.real_address,
+                    ev.real_address_port,
+                    ev.reason_text,
+                    ev.raw_line,
+                    ev.timestamp,
+                )
+                for ev in events
+            ]
+            conn.executemany('''
+                INSERT INTO connection_events
+                    (server_name, event_type, username, real_address,
+                     real_address_port, reason_text, raw_line, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', event_rows)
+
+            window = LOG_EVENT_MATCH_WINDOW
+
+            for ev in events:
+                if not ev.real_address or not ev.real_address_port:
+                    continue
+
+                if ev.event_type in ('disconnect', 'inactivity'):
+                    # Match the most recent matching session whose
+                    # disconnected_at is within the time window. If none has
+                    # disconnected_at yet, pick the active one — the next
+                    # status snapshot will close it.
+                    conn.execute('''
+                        UPDATE sessions SET disconnect_reason = ?
+                        WHERE id = (
+                            SELECT id FROM sessions
+                            WHERE server_name = ? AND real_address = ?
+                              AND real_address_port = ?
+                              AND disconnect_reason IS NULL
+                              AND (
+                                disconnected_at IS NULL
+                                OR ABS(CAST(strftime('%s', disconnected_at) AS INTEGER)
+                                     - CAST(strftime('%s', ?) AS INTEGER)) <= ?
+                              )
+                            ORDER BY connected_since DESC
+                            LIMIT 1
+                        )
+                    ''', (
+                        ev.reason_text or ev.event_type,
+                        ev.server_name, ev.real_address, ev.real_address_port,
+                        ev.timestamp, window,
+                    ))
+
+                elif ev.event_type == 'peer_init' and ev.extra and ev.extra.get('handshake_ms') is not None:
+                    conn.execute('''
+                        UPDATE sessions SET tls_handshake_ms = ?
+                        WHERE id = (
+                            SELECT id FROM sessions
+                            WHERE server_name = ? AND real_address = ?
+                              AND real_address_port = ?
+                              AND tls_handshake_ms IS NULL
+                              AND ABS(CAST(strftime('%s', connected_since) AS INTEGER)
+                                    - CAST(strftime('%s', ?) AS INTEGER)) <= ?
+                            ORDER BY ABS(CAST(strftime('%s', connected_since) AS INTEGER)
+                                       - CAST(strftime('%s', ?) AS INTEGER))
+                            LIMIT 1
+                        )
+                    ''', (
+                        ev.extra['handshake_ms'],
+                        ev.server_name, ev.real_address, ev.real_address_port,
+                        ev.timestamp, window, ev.timestamp,
+                    ))
+
+                elif ev.event_type == 'reneg':
+                    conn.execute('''
+                        UPDATE sessions SET reneg_count = COALESCE(reneg_count, 0) + 1
+                        WHERE id = (
+                            SELECT id FROM sessions
+                            WHERE server_name = ? AND real_address = ?
+                              AND real_address_port = ?
+                              AND disconnected_at IS NULL
+                            ORDER BY connected_since DESC
+                            LIMIT 1
+                        )
+                    ''', (ev.server_name, ev.real_address, ev.real_address_port))
+
+            conn.commit()
+
+    def get_auth_failures(self, server_name: Optional[str] = None,
+                          hours: int = 24, limit: int = 200) -> List[Dict]:
+        """Return recent auth/verify/TLS failures, newest first."""
+        since = utcnow() - timedelta(hours=hours)
+        params: list = ['auth_failure', 'verify_error', 'tls_error', since]
+        server_filter = ''
+        if server_name:
+            server_filter = ' AND server_name = ?'
+            params.append(server_name)
+        params.append(limit)
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(f'''
+                SELECT id, server_name, event_type, username,
+                       real_address, real_address_port, reason_text,
+                       raw_line, timestamp
+                FROM connection_events
+                WHERE event_type IN (?, ?, ?)
+                  AND timestamp > ?
+                  {server_filter}
+                ORDER BY timestamp DESC
+                LIMIT ?
+            ''', params).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_auth_failure_summary(self, server_name: Optional[str] = None,
+                                  hours: int = 24) -> Dict:
+        """Aggregate counters used by the dashboard summary card."""
+        since = utcnow() - timedelta(hours=hours)
+        params: list = ['auth_failure', 'verify_error', 'tls_error', since]
+        server_filter = ''
+        if server_name:
+            server_filter = ' AND server_name = ?'
+            params.append(server_name)
+        with self._connect() as conn:
+            row = conn.execute(f'''
+                SELECT COUNT(*) AS total,
+                       COUNT(DISTINCT real_address) AS unique_ips
+                FROM connection_events
+                WHERE event_type IN (?, ?, ?)
+                  AND timestamp > ?
+                  {server_filter}
+            ''', params).fetchone()
+            return {
+                'total': row[0] if row else 0,
+                'unique_ips': row[1] if row else 0,
+                'hours': hours,
+            }
+
+    def get_recent_events(self, server_name: Optional[str] = None,
+                          event_types: Optional[List[str]] = None,
+                          limit: int = 100) -> List[Dict]:
+        """Live tail: most-recent connection_events filtered by type/server."""
+        params: list = []
+        where = []
+        if event_types:
+            placeholders = ','.join('?' * len(event_types))
+            where.append(f'event_type IN ({placeholders})')
+            params.extend(event_types)
+        if server_name:
+            where.append('server_name = ?')
+            params.append(server_name)
+        where_sql = ('WHERE ' + ' AND '.join(where)) if where else ''
+        params.append(limit)
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(f'''
+                SELECT id, server_name, event_type, username,
+                       real_address, real_address_port, reason_text,
+                       raw_line, timestamp
+                FROM connection_events
+                {where_sql}
+                ORDER BY timestamp DESC
+                LIMIT ?
+            ''', params).fetchall()
+            return [dict(r) for r in rows]
 
     def get_users_list(self, server_name: Optional[str] = None) -> List[Dict]:
         """Get list of all users with online status"""
@@ -1063,103 +1377,605 @@ class DatabaseManager:
                 'server_count': row[3] or 0
             }
 
-# Parser for OpenVPN `status-version 2` files (the same format emitted by
-# OpenVPN 2.5, 2.6 and later). See the OpenVPN man page for the exact layout.
+# Parser for OpenVPN status files. Supports both versions of the format:
+#
+#   status-version 2 (recommended, OpenVPN 2.4+ default in many distros):
+#       TITLE,...
+#       TIME,2026-05-14 08:21:16,1778746876
+#       HEADER,CLIENT_LIST,Common Name,Real Address,Virtual Address,...
+#       CLIENT_LIST,alice,1.2.3.4:5000,10.8.0.10,,...,2026-05-14 07:52:19,...
+#       HEADER,ROUTING_TABLE,Virtual Address,Common Name,Real Address,...
+#       ROUTING_TABLE,10.8.0.10,alice,1.2.3.4:5000,...
+#
+#   status-version 1 (legacy default):
+#       OpenVPN CLIENT LIST
+#       Updated,2026-05-14 08:22:18
+#       Common Name,Real Address,Bytes Received,Bytes Sent,Connected Since
+#       alice,1.2.3.4:5000,12345,67890,2026-05-14 07:34:30
+#       ROUTING TABLE
+#       Virtual Address,Common Name,Real Address,Last Ref
+#       10.8.0.10,alice,1.2.3.4:5000,2026-05-14 08:22:17
+#       GLOBAL STATS
+#       ...
+#       END
+#
+# Both formats are auto-detected on every parse so a server can switch
+# between them (e.g. after an OpenVPN upgrade) without restarting the
+# dashboard.
 class OpenVPNParser:
+    # IPv6 routing-table entries (status v1 emits them) — used only to skip.
+    _RE_IPV6 = re.compile(r'^[0-9a-fA-F:]+$')
+
     def __init__(self, status_file: str, server_name: str = "default"):
         self.status_file = status_file
         self.server_name = server_name
-    
+        self._format_logged: Optional[int] = None
+
     def parse_status_file(self) -> List[VPNSession]:
-        sessions = []
-        
         if not os.path.exists(self.status_file):
             logger.warning(f"[{self.server_name}] Status file not found: {self.status_file}")
-            return sessions
-        
+            return []
+
         try:
             with open(self.status_file, 'r') as f:
                 lines = f.readlines()
-            
-            logger.debug(f"[{self.server_name}] Parsing status file: {len(lines)} lines")
-            
-            routing_table = {}
-            
-            for line_num, line in enumerate(lines, 1):
-                line = line.strip()
-                
-                try:
-                    if line.startswith('CLIENT_LIST') and not line.startswith('CLIENT_LIST,Common Name'):
-                        parts = line.split(',')
-                        
-                        if len(parts) >= 8:
-                            username = parts[1]
-                            real_address_with_port = parts[2]
-                            
-                            # Extract IP and port separately
-                            if ':' in real_address_with_port:
-                                real_address, real_address_port = real_address_with_port.rsplit(':', 1)
-                            else:
-                                real_address = real_address_with_port
-                                real_address_port = 'unknown'
-                            
-                            virtual_address = parts[3] if len(parts) > 3 and parts[3] else None
-                            
-                            try:
-                                bytes_received = int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else 0
-                                bytes_sent = int(parts[6]) if len(parts) > 6 and parts[6].isdigit() else 0
-                            except (ValueError, IndexError) as e:
-                                logger.warning(f"[{self.server_name}] Error parsing bytes on line {line_num}: {e}")
-                                bytes_received = 0
-                                bytes_sent = 0
-                                
-                            connected_since_str = parts[7] if len(parts) > 7 else ""
-                            
-                            try:
-                                connected_since = datetime.strptime(connected_since_str, "%Y-%m-%d %H:%M:%S")
-                            except (ValueError, IndexError) as e:
-                                logger.warning(f"[{self.server_name}] Error parsing date on line {line_num}: {e}")
-                                connected_since = utcnow()
-                            
-                            session = VPNSession(
-                                username=username,
-                                real_address=real_address,
-                                real_address_port=real_address_port,
-                                virtual_address=virtual_address,
-                                bytes_received=bytes_received,
-                                bytes_sent=bytes_sent,
-                                connected_since=connected_since,
-                                server_name=self.server_name
-                            )
-                            
-                            sessions.append(session)
-                        else:
-                            logger.warning(f"[{self.server_name}] Incomplete CLIENT_LIST on line {line_num}")
-                    
-                    elif line.startswith('ROUTING_TABLE') and ',' in line and not line.startswith('ROUTING_TABLE,Virtual Address'):
-                        parts = line.split(',')
-                        if len(parts) >= 3:
-                            virtual_ip = parts[1]
-                            username = parts[2]
-                            routing_table[username] = virtual_ip
-                            
-                except Exception as e:
-                    logger.error(f"[{self.server_name}] Error parsing line {line_num}: {e}")
-                    continue
-            
-            # Apply routing table info
-            for session in sessions:
-                if not session.virtual_address and session.username in routing_table:
-                    session.virtual_address = routing_table[session.username]
-            
-            logger.info(f"[{self.server_name}] Parsed {len(sessions)} sessions")
-            
         except IOError as e:
             logger.error(f"[{self.server_name}] I/O error reading status file: {e}")
+            return []
+
+        version = self._detect_version(lines)
+        if version != self._format_logged:
+            logger.info(f"[{self.server_name}] status file format detected: status-version {version}")
+            self._format_logged = version
+
+        try:
+            if version == 2:
+                sessions = self._parse_v2(lines)
+            elif version == 1:
+                sessions = self._parse_v1(lines)
+            else:
+                logger.warning(
+                    f"[{self.server_name}] Unrecognised status file format "
+                    f"(neither v1 nor v2). First non-empty line: "
+                    f"{next((l.strip() for l in lines if l.strip()), '<empty>')!r}"
+                )
+                return []
         except Exception as e:
             logger.error(f"[{self.server_name}] Unexpected error parsing status file: {e}")
-        
+            return []
+
+        logger.info(f"[{self.server_name}] Parsed {len(sessions)} sessions (status-version {version})")
         return sessions
+
+    @classmethod
+    def _detect_version(cls, lines: List[str]) -> Optional[int]:
+        """Sniff the format from the first ~40 lines.
+
+        v2 has explicit `TITLE,`/`HEADER,`/`CLIENT_LIST,` line prefixes.
+        v1 starts with the literal banner `OpenVPN CLIENT LIST`.
+        """
+        for raw in lines[:40]:
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(('TITLE,', 'TIME,', 'HEADER,CLIENT_LIST', 'CLIENT_LIST,')):
+                return 2
+            if stripped == 'OpenVPN CLIENT LIST':
+                return 1
+        return None
+
+    @staticmethod
+    def _split_endpoint(endpoint: str) -> Tuple[str, str]:
+        """Split `ip:port` (IPv4 or IPv6 in brackets) into (ip, port)."""
+        if ':' in endpoint:
+            ip, port = endpoint.rsplit(':', 1)
+            return ip, port
+        return endpoint, 'unknown'
+
+    @staticmethod
+    def _parse_dt(value: str) -> datetime:
+        """Parse `YYYY-MM-DD HH:MM:SS` from a status file. Falls back to now."""
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            return utcnow()
+
+    # ----- status-version 2 ------------------------------------------------
+
+    def _parse_v2(self, lines: List[str]) -> List[VPNSession]:
+        sessions: List[VPNSession] = []
+        routing_table: Dict[str, str] = {}
+
+        for line_num, raw in enumerate(lines, 1):
+            line = raw.strip()
+            try:
+                if line.startswith('CLIENT_LIST,') and not line.startswith('CLIENT_LIST,Common Name'):
+                    parts = line.split(',')
+                    if len(parts) < 8:
+                        logger.warning(f"[{self.server_name}] Incomplete CLIENT_LIST on line {line_num}")
+                        continue
+
+                    username = parts[1]
+                    ip, port = self._split_endpoint(parts[2])
+                    virtual_address = parts[3] or None
+                    bytes_received = int(parts[5]) if parts[5].isdigit() else 0
+                    bytes_sent = int(parts[6]) if parts[6].isdigit() else 0
+                    connected_since = self._parse_dt(parts[7])
+
+                    sessions.append(VPNSession(
+                        username=username,
+                        real_address=ip,
+                        real_address_port=port,
+                        virtual_address=virtual_address,
+                        bytes_received=bytes_received,
+                        bytes_sent=bytes_sent,
+                        connected_since=connected_since,
+                        server_name=self.server_name,
+                    ))
+
+                elif line.startswith('ROUTING_TABLE,') and not line.startswith('ROUTING_TABLE,Virtual Address'):
+                    parts = line.split(',')
+                    if len(parts) >= 3:
+                        # Skip IPv6 routes — sessions table only carries the IPv4 vIP.
+                        if self._RE_IPV6.match(parts[1]) and '.' not in parts[1]:
+                            continue
+                        routing_table[parts[2]] = parts[1]
+
+            except Exception as e:
+                logger.error(f"[{self.server_name}] v2 parse error on line {line_num}: {e}")
+                continue
+
+        for session in sessions:
+            if not session.virtual_address and session.username in routing_table:
+                session.virtual_address = routing_table[session.username]
+
+        return sessions
+
+    # ----- status-version 1 (legacy) --------------------------------------
+
+    # Sections we care about in v1.
+    _V1_SECTIONS = {
+        'OpenVPN CLIENT LIST': 'clients',
+        'ROUTING TABLE': 'routes',
+        'GLOBAL STATS': 'stats',
+        'END': 'end',
+    }
+
+    def _parse_v1(self, lines: List[str]) -> List[VPNSession]:
+        sessions: List[VPNSession] = []
+        routing_table: Dict[str, str] = {}
+        section: Optional[str] = None
+        # Column index map for the current section's data rows. v1 header
+        # ordering can differ across OpenVPN builds, so we honour the actual
+        # column header line instead of assuming positions.
+        client_cols: Dict[str, int] = {}
+        route_cols: Dict[str, int] = {}
+
+        # Default v1 column names (per OpenVPN docs) — fallbacks if the
+        # header line is missing for some reason.
+        default_client_cols = {
+            'common name': 0,
+            'real address': 1,
+            'bytes received': 2,
+            'bytes sent': 3,
+            'connected since': 4,
+        }
+        default_route_cols = {
+            'virtual address': 0,
+            'common name': 1,
+            'real address': 2,
+            'last ref': 3,
+        }
+
+        for line_num, raw in enumerate(lines, 1):
+            line = raw.strip()
+            if not line:
+                continue
+
+            new_section = self._V1_SECTIONS.get(line)
+            if new_section is not None:
+                section = new_section
+                client_cols = {}
+                route_cols = {}
+                continue
+
+            if section in (None, 'stats', 'end'):
+                # We're outside any section we care about (or in GLOBAL STATS / END).
+                continue
+
+            if section == 'clients':
+                if line.startswith('Updated,'):
+                    continue
+                lower = line.lower()
+                # Header line: detect by presence of well-known column names.
+                if 'common name' in lower and 'real address' in lower:
+                    client_cols = {h.strip().lower(): i for i, h in enumerate(line.split(','))}
+                    continue
+                cols = client_cols or default_client_cols
+                parts = line.split(',')
+                try:
+                    cn = parts[cols['common name']]
+                    endpoint = parts[cols['real address']]
+                    ip, port = self._split_endpoint(endpoint)
+                    bytes_received = int(parts[cols['bytes received']])
+                    bytes_sent = int(parts[cols['bytes sent']])
+                    connected_since = self._parse_dt(parts[cols['connected since']])
+
+                    sessions.append(VPNSession(
+                        username=cn,
+                        real_address=ip,
+                        real_address_port=port,
+                        virtual_address=None,  # backfilled from routing table below
+                        bytes_received=bytes_received,
+                        bytes_sent=bytes_sent,
+                        connected_since=connected_since,
+                        server_name=self.server_name,
+                    ))
+                except (KeyError, IndexError, ValueError) as e:
+                    logger.warning(f"[{self.server_name}] v1 CLIENT row line {line_num}: {e}")
+
+            elif section == 'routes':
+                lower = line.lower()
+                if 'virtual address' in lower and 'common name' in lower:
+                    route_cols = {h.strip().lower(): i for i, h in enumerate(line.split(','))}
+                    continue
+                cols = route_cols or default_route_cols
+                parts = line.split(',')
+                try:
+                    vip = parts[cols['virtual address']]
+                    cn = parts[cols['common name']]
+                    # Skip IPv6 entries — sessions table only stores one
+                    # virtual address and the IPv4 one is usually meant.
+                    if ':' in vip and '.' not in vip:
+                        continue
+                    routing_table[cn] = vip
+                except (KeyError, IndexError):
+                    continue
+
+        for session in sessions:
+            if not session.virtual_address and session.username in routing_table:
+                session.virtual_address = routing_table[session.username]
+
+        return sessions
+
+
+# ---------------------------------------------------------------------------
+# OpenVPN main log parser
+# ---------------------------------------------------------------------------
+#
+# Reads `openvpn.log` (configured via `log` / `log-append` in server.conf,
+# verbosity ≥ 3 recommended) and turns interesting lines into typed events.
+#
+# Operates incrementally: state is persisted to `log_parse_state` so the
+# parser only ever reads the new bytes since the last cycle. Detects file
+# rotation by comparing inode/size and restarts from offset 0 when the file
+# was rotated or truncated.
+#
+# Event types emitted:
+#   auth_failure  — bad password or pre-auth error
+#   verify_error  — certificate verification failure (expired/untrusted)
+#   tls_error     — TLS handshake failed for non-auth reason
+#   peer_init     — successful "Peer Connection Initiated" (used to compute
+#                   TLS handshake latency together with the matching
+#                   "TLS: Initial packet from" line that arrived earlier)
+#   reneg         — TLS soft reset (rekey) on a live session
+#   disconnect    — SIGTERM/SIGINT/SIGUSR1, with the reason payload preserved
+#   inactivity    — `Inactivity timeout (--ping-restart)` server-side detection
+
+@dataclass
+class LogEvent:
+    event_type: str
+    timestamp: datetime
+    server_name: str
+    username: Optional[str] = None
+    real_address: Optional[str] = None
+    real_address_port: Optional[str] = None
+    reason_text: Optional[str] = None
+    raw_line: Optional[str] = None
+    extra: Optional[Dict] = None  # parser-private payload (e.g. handshake_ms)
+
+
+class OpenVPNLogParser:
+    # Two timestamp formats we know about:
+    #   1. "Mon May 14 10:00:00 2026" — default OpenVPN `--log` output
+    #   2. "2026-05-14 10:00:00"     — produced by some packagers / wrappers
+    _RE_TS_LEGACY = re.compile(
+        r'^(?P<ts>\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(?P<rest>.*)$'
+    )
+    _RE_TS_ISO = re.compile(
+        r'^(?P<ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})(?:[.,]\d+)?\s+(?P<rest>.*)$'
+    )
+
+    # Common pieces shared by multiple patterns. CN is optional because
+    # pre-auth lines don't carry it; IPv4 only for now (covers > 99% of real
+    # deployments). Port is part of the OpenVPN endpoint identifier.
+    _IP_PORT = r'(?P<ip>\d{1,3}(?:\.\d{1,3}){3}):(?P<port>\d{1,5})'
+    _CN = r'(?P<cn>[A-Za-z0-9._@\-]+)'
+
+    _PAT_AUTH_FAIL = re.compile(
+        rf'(?:{_CN}/)?{_IP_PORT}\s+TLS Auth Error: (?P<reason>.+?)(?:\s+for peer)?$'
+    )
+    _PAT_VERIFY_ERROR = re.compile(
+        rf'{_IP_PORT}\s+VERIFY ERROR: (?P<reason>.+)$'
+    )
+    _PAT_TLS_ERROR = re.compile(
+        rf'(?:{_CN}/)?{_IP_PORT}\s+TLS Error: (?P<reason>.+)$'
+    )
+    _PAT_PEER_INIT = re.compile(
+        rf'{_CN}/{_IP_PORT}\s+\[\S+\]\s+Peer Connection Initiated'
+    )
+    _PAT_TLS_INIT = re.compile(
+        rf'{_IP_PORT}\s+TLS: Initial packet from'
+    )
+    _PAT_RENEG = re.compile(
+        rf'(?:{_CN}/)?{_IP_PORT}\s+TLS: soft reset'
+    )
+    _PAT_SIGNAL = re.compile(
+        rf'{_CN}/{_IP_PORT}\s+SIG(?P<sig>TERM|INT|USR1|HUP)\[(?P<flag>[^,\]]+),(?P<reason>[^\]]+)\]'
+    )
+    _PAT_INACTIVITY = re.compile(
+        rf'{_CN}/{_IP_PORT}\s+\[\S+\]\s+Inactivity timeout \(--ping-restart\)'
+    )
+    _PAT_AUTH_USERNAME_PASSWORD_FAIL = re.compile(
+        # Newer OpenVPN: explicit username on its own line
+        rf'(?:{_CN}/)?{_IP_PORT}\s+PLUGIN_CALL:.*auth-user-pass.*status=1'
+    )
+
+    def __init__(self, log_file: Optional[str], server_name: str):
+        self.log_file = log_file
+        self.server_name = server_name
+        # Pending TLS handshakes: (ip, port) -> (start_ts, raw_line). Pruned
+        # when matched or after _HANDSHAKE_PRUNE_SEC. Lives in process memory
+        # — losing it on restart only means we miss handshake latency for
+        # in-flight handshakes, which is harmless.
+        self._pending_handshakes: Dict[Tuple[str, str], datetime] = {}
+        self._handshake_prune_sec = 120
+        self._missing_logged = False
+
+    @classmethod
+    def _parse_timestamp(cls, line: str) -> Tuple[Optional[datetime], str]:
+        """Return (timestamp, rest_of_line) or (None, line) if no timestamp."""
+        m = cls._RE_TS_LEGACY.match(line)
+        if m:
+            try:
+                # %d copes with both "5" and "05"
+                ts = datetime.strptime(m.group('ts'), '%a %b %d %H:%M:%S %Y')
+                return ts, m.group('rest')
+            except ValueError:
+                pass
+        m = cls._RE_TS_ISO.match(line)
+        if m:
+            try:
+                ts = datetime.strptime(m.group('ts'), '%Y-%m-%d %H:%M:%S')
+                return ts, m.group('rest')
+            except ValueError:
+                pass
+        return None, line
+
+    def _prune_pending(self, now: datetime):
+        cutoff = now - timedelta(seconds=self._handshake_prune_sec)
+        stale = [k for k, ts in self._pending_handshakes.items() if ts < cutoff]
+        for k in stale:
+            self._pending_handshakes.pop(k, None)
+
+    def parse_line(self, line: str) -> Optional[LogEvent]:
+        """Recognise a single line and return a LogEvent (or None)."""
+        line = line.rstrip('\n')
+        if not line.strip():
+            return None
+
+        ts, rest = self._parse_timestamp(line)
+        # Even if we couldn't parse the timestamp (verbose-syslog/custom
+        # format) we still want to recognise the event — fall back to "now".
+        ts = ts or utcnow()
+        self._prune_pending(ts)
+
+        # ---- TLS auth failure -------------------------------------------
+        m = self._PAT_AUTH_FAIL.search(rest)
+        if m:
+            return LogEvent(
+                event_type='auth_failure',
+                timestamp=ts, server_name=self.server_name,
+                username=m.group('cn'),
+                real_address=m.group('ip'),
+                real_address_port=m.group('port'),
+                reason_text=m.group('reason').strip(),
+                raw_line=line,
+            )
+
+        # ---- Cert verify failure ----------------------------------------
+        m = self._PAT_VERIFY_ERROR.search(rest)
+        if m:
+            return LogEvent(
+                event_type='verify_error',
+                timestamp=ts, server_name=self.server_name,
+                real_address=m.group('ip'),
+                real_address_port=m.group('port'),
+                reason_text=m.group('reason').strip(),
+                raw_line=line,
+            )
+
+        # ---- TLS error (handshake failed, etc.) -------------------------
+        m = self._PAT_TLS_ERROR.search(rest)
+        if m:
+            return LogEvent(
+                event_type='tls_error',
+                timestamp=ts, server_name=self.server_name,
+                username=m.group('cn'),
+                real_address=m.group('ip'),
+                real_address_port=m.group('port'),
+                reason_text=m.group('reason').strip(),
+                raw_line=line,
+            )
+
+        # ---- TLS handshake start: remember the timestamp ----------------
+        m = self._PAT_TLS_INIT.search(rest)
+        if m:
+            key = (m.group('ip'), m.group('port'))
+            # Only the first packet per (ip, port) starts a handshake;
+            # later retries reuse the same key, so don't overwrite to keep
+            # the earliest start time.
+            self._pending_handshakes.setdefault(key, ts)
+            return None  # not a standalone event we record
+
+        # ---- Peer Connection Initiated → handshake complete -------------
+        m = self._PAT_PEER_INIT.search(rest)
+        if m:
+            key = (m.group('ip'), m.group('port'))
+            start_ts = self._pending_handshakes.pop(key, None)
+            handshake_ms: Optional[int] = None
+            if start_ts and ts >= start_ts:
+                handshake_ms = int((ts - start_ts).total_seconds() * 1000)
+            return LogEvent(
+                event_type='peer_init',
+                timestamp=ts, server_name=self.server_name,
+                username=m.group('cn'),
+                real_address=m.group('ip'),
+                real_address_port=m.group('port'),
+                reason_text=None,
+                raw_line=line,
+                extra={'handshake_ms': handshake_ms} if handshake_ms is not None else None,
+            )
+
+        # ---- Renegotiation ----------------------------------------------
+        m = self._PAT_RENEG.search(rest)
+        if m:
+            return LogEvent(
+                event_type='reneg',
+                timestamp=ts, server_name=self.server_name,
+                username=m.group('cn'),
+                real_address=m.group('ip'),
+                real_address_port=m.group('port'),
+                raw_line=line,
+            )
+
+        # ---- Disconnect (SIGTERM/SIGINT/SIGUSR1/SIGHUP) -----------------
+        m = self._PAT_SIGNAL.search(rest)
+        if m:
+            return LogEvent(
+                event_type='disconnect',
+                timestamp=ts, server_name=self.server_name,
+                username=m.group('cn'),
+                real_address=m.group('ip'),
+                real_address_port=m.group('port'),
+                reason_text=f"SIG{m.group('sig')}[{m.group('flag')},{m.group('reason')}]",
+                raw_line=line,
+            )
+
+        # ---- Inactivity timeout -----------------------------------------
+        m = self._PAT_INACTIVITY.search(rest)
+        if m:
+            return LogEvent(
+                event_type='inactivity',
+                timestamp=ts, server_name=self.server_name,
+                username=m.group('cn'),
+                real_address=m.group('ip'),
+                real_address_port=m.group('port'),
+                reason_text='ping-restart',
+                raw_line=line,
+            )
+
+        return None
+
+    def parse_incremental(self, prev_state: Optional[Dict]) -> Tuple[List[LogEvent], Dict]:
+        """Return (new_events, new_state).
+
+        `prev_state` is the row from `log_parse_state` (or None on first run).
+        The returned `new_state` should be persisted by the caller.
+        """
+        if not self.log_file:
+            return [], {'log_path': None, 'inode': None, 'size': 0, 'offset': 0}
+
+        if not os.path.exists(self.log_file):
+            if not self._missing_logged:
+                logger.warning(
+                    f"[{self.server_name}] OpenVPN log file not found: "
+                    f"{self.log_file} — log-derived features (auth failures, "
+                    f"disconnect reasons, TLS metrics) will be unavailable. "
+                    f"Add `log-append {self.log_file}` to your OpenVPN config."
+                )
+                self._missing_logged = True
+            return [], {
+                'log_path': self.log_file, 'inode': None, 'size': 0, 'offset': 0,
+            }
+
+        # Reset the "missing" warning latch once the file appears.
+        self._missing_logged = False
+
+        try:
+            stat = os.stat(self.log_file)
+        except OSError as e:
+            logger.warning(f"[{self.server_name}] stat() failed on {self.log_file}: {e}")
+            return [], prev_state or {
+                'log_path': self.log_file, 'inode': None, 'size': 0, 'offset': 0,
+            }
+
+        prev_inode = prev_state.get('inode') if prev_state else None
+        prev_offset = prev_state.get('offset', 0) if prev_state else 0
+
+        # Detect rotation / truncation: inode changed or file shrank below
+        # our last offset.
+        rotated = (prev_inode is not None and prev_inode != stat.st_ino) \
+            or (stat.st_size < prev_offset)
+        start_offset = 0 if rotated else prev_offset
+
+        # Cap how many bytes we read per cycle so a freshly-rotated huge
+        # file doesn't stall the collector.
+        bytes_to_read = stat.st_size - start_offset
+        if bytes_to_read <= 0:
+            return [], {
+                'log_path': self.log_file,
+                'inode': stat.st_ino,
+                'size': stat.st_size,
+                'offset': stat.st_size,
+            }
+
+        end_offset = start_offset + min(bytes_to_read, LOG_PARSE_MAX_BYTES)
+
+        events: List[LogEvent] = []
+        try:
+            with open(self.log_file, 'rb') as f:
+                f.seek(start_offset)
+                chunk = f.read(end_offset - start_offset)
+        except OSError as e:
+            logger.warning(f"[{self.server_name}] read() failed on {self.log_file}: {e}")
+            return [], prev_state or {
+                'log_path': self.log_file, 'inode': stat.st_ino,
+                'size': stat.st_size, 'offset': prev_offset,
+            }
+
+        # Trim a trailing partial line so we don't half-parse it; we'll pick
+        # it up on the next cycle starting from the last newline.
+        last_nl = chunk.rfind(b'\n')
+        if last_nl < 0:
+            # No complete line yet — wait for one to be written.
+            return [], {
+                'log_path': self.log_file,
+                'inode': stat.st_ino,
+                'size': stat.st_size,
+                'offset': start_offset,
+            }
+        consumed = chunk[:last_nl + 1]
+        new_offset = start_offset + len(consumed)
+
+        for raw in consumed.decode('utf-8', errors='replace').splitlines():
+            ev = self.parse_line(raw)
+            if ev is not None:
+                events.append(ev)
+
+        if rotated:
+            logger.info(
+                f"[{self.server_name}] log rotation detected for "
+                f"{self.log_file} — restarted parsing from offset 0"
+            )
+
+        return events, {
+            'log_path': self.log_file,
+            'inode': stat.st_ino,
+            'size': stat.st_size,
+            'offset': new_offset,
+        }
+
 
 # Multi-Server Stats Collector
 class MultiServerStatsCollector:
@@ -1167,9 +1983,13 @@ class MultiServerStatsCollector:
         self.db = DatabaseManager(DB_PATH)
         self.parsers = []
         for server in SERVERS:
+            log_parser = None
+            if LOG_PARSE_ENABLED and server.get('log_file'):
+                log_parser = OpenVPNLogParser(server['log_file'], server['name'])
             self.parsers.append({
                 'name': server['name'],
-                'parser': OpenVPNParser(server['status_file'], server['name'])
+                'parser': OpenVPNParser(server['status_file'], server['name']),
+                'log_parser': log_parser,
             })
         self.running = False
         self.cleanup_counter = 0  # cycles since last cleanup
@@ -1182,6 +2002,7 @@ class MultiServerStatsCollector:
         for parser_info in self.parsers:
             server_name = parser_info['name']
             parser = parser_info['parser']
+            log_parser = parser_info.get('log_parser')
 
             logger.info(f"\n[{server_name}] Processing...")
 
@@ -1228,10 +2049,27 @@ class MultiServerStatsCollector:
                     self.db.update_user_stats(db_session['username'], server_name)
                     disconnected_count += 1
 
-                logger.info(
-                    f"[{server_name}] Updated: {len(sessions)} active, "
-                    f"{disconnected_count} disconnected"
-                )
+                # Log parsing runs *after* sessions are persisted so
+                # log-derived events (disconnect_reason, handshake_ms, reneg)
+                # have a row to attach to in the same cycle.
+                events_count = 0
+                if log_parser is not None:
+                    try:
+                        prev_state = self.db.get_log_parse_state(server_name)
+                        events, new_state = log_parser.parse_incremental(prev_state)
+                        if events:
+                            self.db.save_log_events(events)
+                            events_count = len(events)
+                        if new_state and new_state.get('log_path'):
+                            self.db.save_log_parse_state(server_name, new_state)
+                    except Exception as e:
+                        logger.warning(f"[{server_name}] log parse failed: {e}")
+
+                msg = (f"[{server_name}] Updated: {len(sessions)} active, "
+                       f"{disconnected_count} disconnected")
+                if log_parser is not None:
+                    msg += f", {events_count} log events"
+                logger.info(msg)
 
             except Exception as e:
                 logger.error(f"[{server_name}] Error processing server: {e}")
@@ -1489,7 +2327,12 @@ def api_user_sessions(username):
                 'connected_since': s['connected_since'],
                 'disconnected_at': s.get('disconnected_at'),
                 'duration': duration_str,
-                'status': s['status']
+                'status': s['status'],
+                # Log-derived fields (added in schema v3). They are nullable
+                # — clients should treat missing values as "no log data".
+                'disconnect_reason': s.get('disconnect_reason'),
+                'tls_handshake_ms': s.get('tls_handshake_ms'),
+                'reneg_count': s.get('reneg_count') or 0,
             })
         
         return jsonify(formatted)
@@ -1525,6 +2368,8 @@ def api_summary():
         'all': 'All Time'
     }
     
+    auth_failures = db.get_auth_failure_summary(server, hours=24)
+
     return jsonify({
         'active_users': summary['active_users'],
         'total_users': summary['total_users'],
@@ -1532,8 +2377,37 @@ def api_summary():
         'total_traffic_gb': traffic_gb,
         'server_count': summary['server_count'],
         'traffic_period': period,
-        'traffic_period_label': period_labels.get(period, 'All Time')
+        'traffic_period_label': period_labels.get(period, 'All Time'),
+        'auth_failures_24h': auth_failures['total'],
+        'auth_failure_unique_ips_24h': auth_failures['unique_ips'],
     })
+
+
+@app.route('/api/auth_failures')
+@require_auth
+def api_auth_failures():
+    """Recent auth/verify/TLS failures parsed from openvpn.log."""
+    server = request.args.get('server')
+    hours = max(1, min(request.args.get('hours', 24, type=int), 24 * 30))
+    limit = max(1, min(request.args.get('limit', 200, type=int), 1000))
+    return jsonify({
+        'failures': db.get_auth_failures(server, hours, limit),
+        'summary': db.get_auth_failure_summary(server, hours),
+    })
+
+
+@app.route('/api/recent_events')
+@require_auth
+def api_recent_events():
+    """Live tail of connection_events. Optional filters: server, types."""
+    server = request.args.get('server')
+    types_param = request.args.get('types', '')
+    types = [t.strip() for t in types_param.split(',') if t.strip()] or None
+    limit = max(1, min(request.args.get('limit', 100, type=int), 1000))
+    return jsonify({
+        'events': db.get_recent_events(server, types, limit),
+    })
+
 
 @app.route('/api/export/sessions')
 @require_auth

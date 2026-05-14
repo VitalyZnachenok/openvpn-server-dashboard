@@ -591,6 +591,10 @@
                 <div class="stat-value" id="serverCount">-</div>
                 <div class="stat-label">Active Servers</div>
             </div>
+            <div class="stat-card" title="Failed authentication attempts in the last 24 hours (parsed from openvpn.log)">
+                <div class="stat-value" id="authFailures24h">-</div>
+                <div class="stat-label">Failed Auth (24h) / <span id="authFailureUniqueIps">0</span> IPs</div>
+            </div>
         </div>
         
         <!-- Traffic Charts -->
@@ -673,7 +677,53 @@
             <div id="userStatsTable" class="loading">Loading...</div>
             <div class="pagination" id="userPagination"></div>
         </div>
-        
+
+        <!-- Auth Failures -->
+        <div class="dashboard-section">
+            <div class="section-header">
+                <h2 class="section-title">🔐 Auth Failures
+                    <span style="color: var(--text-secondary); font-size: 13px; font-weight: normal;">
+                        (parsed from openvpn.log)
+                    </span>
+                </h2>
+                <div class="controls">
+                    <select id="authFailuresHours">
+                        <option value="1">Last 1 Hour</option>
+                        <option value="6">Last 6 Hours</option>
+                        <option value="24" selected>Last 24 Hours</option>
+                        <option value="168">Last 7 Days</option>
+                    </select>
+                </div>
+            </div>
+            <div id="authFailuresTable" class="loading">Loading...</div>
+        </div>
+
+        <!-- Connection Events Live Tail -->
+        <div class="dashboard-section">
+            <div class="section-header">
+                <h2 class="section-title">📡 Connection Events
+                    <span style="color: var(--text-secondary); font-size: 13px; font-weight: normal;">
+                        live tail
+                    </span>
+                </h2>
+                <div class="controls">
+                    <select id="eventsTypeFilter">
+                        <option value="">All event types</option>
+                        <option value="auth_failure,verify_error,tls_error">Errors only</option>
+                        <option value="disconnect,inactivity">Disconnects only</option>
+                        <option value="peer_init">Successful connects</option>
+                        <option value="reneg">Renegotiations</option>
+                    </select>
+                    <select id="eventsLimit">
+                        <option value="50">Last 50</option>
+                        <option value="100" selected>Last 100</option>
+                        <option value="500">Last 500</option>
+                    </select>
+                </div>
+            </div>
+            <div id="eventsTable" class="loading">Loading...</div>
+        </div>
+
         <div class="refresh-info">
             Auto-refresh every 30 seconds | Last updated: <span id="lastUpdate">-</span>
         </div>
@@ -1198,22 +1248,157 @@
                 $('#totalUsers').text(data.total_users);
                 $('#totalTraffic').text(data.total_traffic_gb + ' GB');
                 $('#serverCount').text(data.server_count);
+                $('#authFailures24h').text(data.auth_failures_24h ?? 0);
+                $('#authFailureUniqueIps').text(data.auth_failure_unique_ips_24h ?? 0);
             });
-            
+
             // Update active sessions
             $.get('/api/active_sessions' + serverParam, function(data) {
                 allActiveSessions = data;
                 renderActiveSessions();
             });
-            
+
             // Update user stats
             updateUserStats();
-            
+
             // Update charts
             updateCharts();
-            
+
+            // Update auth failures + live event tail
+            updateAuthFailures();
+            updateRecentEvents();
+
             // Update last refresh time
             $('#lastUpdate').text(new Date().toLocaleTimeString());
+        }
+
+        // ---- Auth failures table -----------------------------------------
+        function updateAuthFailures() {
+            const hours = $('#authFailuresHours').val() || 24;
+            const params = new URLSearchParams();
+            if (currentServer) params.set('server', currentServer);
+            params.set('hours', hours);
+            params.set('limit', 200);
+
+            $.get('/api/auth_failures?' + params.toString(), function(data) {
+                renderAuthFailures(data.failures || []);
+            }).fail(function() {
+                $('#authFailuresTable').html('<div class="loading">Failed to load auth failures</div>');
+            });
+        }
+
+        function renderAuthFailures(failures) {
+            if (!failures.length) {
+                $('#authFailuresTable').html(
+                    '<div class="loading">No auth failures in the selected period. ' +
+                    'If you expect some, make sure OpenVPN writes to a log file (' +
+                    '<code>log-append</code>) with <code>verb 3</code> or higher and that ' +
+                    'the path is configured in <code>SERVERS_CONFIG</code>.</div>'
+                );
+                return;
+            }
+            const escape = s => $('<div>').text(s == null ? '' : s).html();
+            const typeBadge = t => {
+                const map = {
+                    auth_failure:  ['Auth fail',  '#dc3545'],
+                    verify_error:  ['Cert error', '#fd7e14'],
+                    tls_error:     ['TLS error',  '#6f42c1'],
+                };
+                const [label, color] = map[t] || [t, '#6c757d'];
+                return `<span style="background:${color};color:#fff;padding:2px 6px;border-radius:4px;font-size:11px;">${label}</span>`;
+            };
+            let html = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Server</th>
+                            <th>Type</th>
+                            <th>User</th>
+                            <th>IP</th>
+                            <th>Reason</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+            failures.forEach(f => {
+                html += `
+                    <tr>
+                        <td>${escape(f.timestamp)}</td>
+                        <td>${escape(f.server_name)}</td>
+                        <td>${typeBadge(f.event_type)}</td>
+                        <td>${escape(f.username || '—')}</td>
+                        <td>${escape(f.real_address || '')}${f.real_address_port ? ':' + escape(f.real_address_port) : ''}</td>
+                        <td><code style="font-size:12px;">${escape(f.reason_text || '')}</code></td>
+                    </tr>
+                `;
+            });
+            html += '</tbody></table>';
+            $('#authFailuresTable').html(html);
+        }
+
+        // ---- Recent events live tail -------------------------------------
+        function updateRecentEvents() {
+            const params = new URLSearchParams();
+            if (currentServer) params.set('server', currentServer);
+            const types = $('#eventsTypeFilter').val();
+            if (types) params.set('types', types);
+            params.set('limit', $('#eventsLimit').val() || 100);
+
+            $.get('/api/recent_events?' + params.toString(), function(data) {
+                renderRecentEvents(data.events || []);
+            }).fail(function() {
+                $('#eventsTable').html('<div class="loading">Failed to load events</div>');
+            });
+        }
+
+        function renderRecentEvents(events) {
+            if (!events.length) {
+                $('#eventsTable').html('<div class="loading">No events recorded yet.</div>');
+                return;
+            }
+            const escape = s => $('<div>').text(s == null ? '' : s).html();
+            const typeColors = {
+                auth_failure: '#dc3545',
+                verify_error: '#fd7e14',
+                tls_error:    '#6f42c1',
+                disconnect:   '#6c757d',
+                inactivity:   '#ffc107',
+                peer_init:    '#28a745',
+                reneg:        '#17a2b8',
+            };
+            let html = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Server</th>
+                            <th>Type</th>
+                            <th>User</th>
+                            <th>Endpoint</th>
+                            <th>Reason / Detail</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+            events.forEach(e => {
+                const color = typeColors[e.event_type] || '#6c757d';
+                const endpoint = e.real_address
+                    ? `${escape(e.real_address)}${e.real_address_port ? ':' + escape(e.real_address_port) : ''}`
+                    : '';
+                html += `
+                    <tr>
+                        <td>${escape(e.timestamp)}</td>
+                        <td>${escape(e.server_name)}</td>
+                        <td><span style="background:${color};color:#fff;padding:2px 6px;border-radius:4px;font-size:11px;">${escape(e.event_type)}</span></td>
+                        <td>${escape(e.username || '—')}</td>
+                        <td>${endpoint}</td>
+                        <td><code style="font-size:12px;">${escape(e.reason_text || '')}</code></td>
+                    </tr>
+                `;
+            });
+            html += '</tbody></table>';
+            $('#eventsTable').html(html);
         }
         
         function updateUserStats() {
@@ -1495,10 +1680,21 @@
         
         function renderSessionItem(session) {
             const statusClass = session.status === 'completed' ? 'completed' : '';
-            const statusBadge = session.status === 'active' 
-                ? '<span class="status-online">Active</span>' 
+            const statusBadge = session.status === 'active'
+                ? '<span class="status-online">Active</span>'
                 : '<span class="status-offline">Completed</span>';
-            
+
+            // Log-derived fields are nullable when openvpn.log isn't available.
+            const reasonLine = session.disconnect_reason
+                ? `<div><strong>Reason:</strong> <code style="font-size:12px;">${$('<div>').text(session.disconnect_reason).html()}</code></div>`
+                : '';
+            const handshakeLine = session.tls_handshake_ms != null
+                ? `<div><strong>TLS handshake:</strong> ${session.tls_handshake_ms} ms</div>`
+                : '';
+            const renegLine = (session.reneg_count || 0) > 0
+                ? `<div><strong>Reneg:</strong> ${session.reneg_count}</div>`
+                : '';
+
             return `<div class="session-item ${statusClass}">
                 <div class="session-header">
                     <span class="session-ip">${session.real_address}</span>
@@ -1512,6 +1708,9 @@
                     <div><strong>Upload:</strong> ↑ ${session.upload_mb} MB</div>
                     <div><strong>Connected:</strong> ${new Date(session.connected_since).toLocaleString()}</div>
                     ${session.disconnected_at ? `<div><strong>Disconnected:</strong> ${new Date(session.disconnected_at).toLocaleString()}</div>` : ''}
+                    ${reasonLine}
+                    ${handshakeLine}
+                    ${renegLine}
                 </div>
             </div>`;
         }
@@ -1584,7 +1783,11 @@
             $('#compareTimeRange').change(function() {
                 updateComparisonChart();
             });
-            
+
+            // Auth failures + events filters
+            $('#authFailuresHours').change(updateAuthFailures);
+            $('#eventsTypeFilter, #eventsLimit').change(updateRecentEvents);
+
             // Auto-refresh every 30 seconds
             setInterval(function() {
                 updateDashboard();

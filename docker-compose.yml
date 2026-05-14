@@ -12,7 +12,13 @@ services:
       FLASK_ENV: production
       DB_PATH: /app/data/openvpn_stats.db
       UPDATE_INTERVAL: "60"
-      SERVERS_CONFIG: "office:/var/log/openvpn/status-openvpn.log:/var/log/openvpn/status-openvpn.log;office-full:/var/log/openvpn/status-openvpn-full.log:/var/log/openvpn/status-openvpn-full.log"
+      # Серверы: NAME:STATUS_FILE[:LOG_FILE], несколько серверов — через ";".
+      # STATUS_FILE — `status` файл OpenVPN (status-version 2).
+      # LOG_FILE — основной openvpn.log (log / log-append). Опционально, но
+      # без него не будут парситься auth-фейлы, причины дисконнекта и TLS-метрики.
+      SERVERS_CONFIG: "office:/var/log/openvpn/status-openvpn.log:/var/log/openvpn/openvpn.log;office-full:/var/log/openvpn/status-openvpn-full.log:/var/log/openvpn/openvpn-full.log"
+      # Парсинг openvpn.log: можно отключить, если лог недоступен или не нужен.
+      LOG_PARSE_ENABLED: "true"
       # Авторизация
       AUTH_ENABLED: "true"
       AUTH_TOKEN: ""  # Укажите токен: python3 -c "import secrets; print(secrets.token_urlsafe(32))"

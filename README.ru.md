@@ -16,6 +16,7 @@
 - Статистика пользователей с поиском/сортировкой
 - 📊 **Сравнение трафика пользователей** (до 10 на одном графике, 6ч/24ч/7д)
 - 📋 **Просмотр сессий пользователя** (активные и недавние)
+- 🔎 **Анализ openvpn.log** (опционально): причины дисконнектов, неуспешные попытки авторизации, латентность TLS-handshake, счётчик renegotiation, live-tail событий
 - Экспорт CSV/JSON (полная выборка, без тихого обрезания)
 - Множественные сессии одного пользователя, корректная обработка переподключений
 - Автомиграции схемы + retention/VACUUM
@@ -37,20 +38,35 @@ make up
 **Несколько серверов:**
 ```yaml
 environment:
-  - SERVERS_CONFIG=server1:/path/status.log:/path/vpn.log;server2:/path/status.log
+  # NAME:STATUS_FILE[:LOG_FILE], несколько серверов через ";"
+  - SERVERS_CONFIG=office:/var/log/openvpn/status.log:/var/log/openvpn/openvpn.log;branch:/var/log/openvpn/branch-status.log:/var/log/openvpn/branch.log
 ```
 
 **Один сервер:**
 ```yaml
 environment:
   - OPENVPN_STATUS_FILE=/var/log/openvpn/openvpn-status.log
+  - OPENVPN_LOG_FILE=/var/log/openvpn/openvpn.log    # опционально, включает разбор лога
 ```
 
+`STATUS_FILE` — это периодический снапшот, который OpenVPN пишет директивой `status` (status-version 2). `LOG_FILE` — основной лог из `log` / `log-append`, его дашборд читает для детекта неудачных авторизаций, причин дисконнектов и метрик TLS-handshake. Если указать в обоих позициях один и тот же путь — дашборд откажется парсить (форматы файлов разные); оставьте третье поле пустым, если openvpn.log недоступен или не нужен.
+
 ### Конфиг OpenVPN
+
+Обязательно:
 ```
-status /var/log/openvpn/openvpn-status.log
-status-version 2
+status      /var/log/openvpn/openvpn-status.log
 ```
+
+Дашборд автоматически распознаёт и парсит оба формата: `status-version 1` (legacy/default) и `status-version 2`. v2 несёт пару дополнительных колонок (Virtual IPv6, Username, Client ID, Peer ID, Cipher) — для новых установок чуть предпочтительнее, но и дефолтный v1 работает.
+
+Рекомендуется (включает фичи на основе лога — auth-фейлы, причины дисконнекта, TLS-метрики):
+```
+log-append  /var/log/openvpn/openvpn.log
+verb        3
+```
+
+`verb 1`/`2` не пишут нужные строки в лог; `verb 4+` тоже работает, но логов будет много. Файл лога должен быть смонтирован read-only в контейнер дашборда (в примере `docker-compose.yml` уже монтируется `/var/log/openvpn`).
 
 ## Авторизация
 
@@ -114,6 +130,9 @@ environment:
 | `RETENTION_DAYS` | `90` | Хранение сессий (дни) |
 | `TRAFFIC_HISTORY_RETENTION_DAYS` | `30` | Хранение данных для графиков (дни) |
 | `DEFAULT_LIMIT` / `MAX_LIMIT` | `50` / `500` | Лимиты пагинации для `/api/user_stats` (не влияют на экспорт) |
+| `LOG_PARSE_ENABLED` | `true` | Включить разбор основного лога OpenVPN (`openvpn.log`) |
+| `LOG_PARSE_MAX_BYTES` | `10485760` | Максимум байт за один цикл парсинга (защита от огромного лога после ротации) |
+| `LOG_EVENT_MATCH_WINDOW` | `180` | Окно (сек) для связки события из лога с сессией по `(server, ip, port)` |
 | `TZ` | `UTC` | Таймзона контейнера. Не меняйте — все времена хранятся и сравниваются в UTC (совпадает с SQLite `CURRENT_TIMESTAMP`). |
 
 ## API
@@ -137,6 +156,8 @@ Authorization: Bearer ВАШ_ТОКЕН
 - `GET /api/user_traffic_chart?users=user1,user2&hours=24` - Данные сравнения пользователей
 - `GET /api/user_sessions/<username>?server=NAME` - Список сессий пользователя
 - `GET /api/users_list?server=NAME` - Список всех пользователей
+- `GET /api/auth_failures?server=NAME&hours=24&limit=200` - Неуспешные авторизации (из `openvpn.log`)
+- `GET /api/recent_events?server=NAME&types=auth_failure,disconnect&limit=100` - Live-tail событий подключения
 - `GET /api/export/sessions?format=csv` - Экспорт сессий
 - `GET /api/export/users?format=json` - Экспорт пользователей
 
@@ -172,11 +193,13 @@ SQLite со следующими таблицами:
 
 | Таблица | Назначение |
 |---------|-----------|
-| `sessions` | По одной строке на VPN-сессию (старт/конец, байты, адреса). |
+| `sessions` | По одной строке на VPN-сессию (старт/конец, байты, адреса). В схеме v3 добавлены nullable-колонки `disconnect_reason`, `tls_handshake_ms`, `reneg_count`, заполняемые из `openvpn.log`. |
 | `user_stats` | Агрегированные счётчики по каждому пользователю (сессии, время, байты). |
 | `traffic_history` | **Дельты** трафика для графиков. Строки с `username IS NULL` — агрегат для главного графика, с `username IS NOT NULL` — для графика сравнения. |
 | `session_traffic_state` | Последние известные кумулятивные счётчики байт по каждой активной сессии; используются для вычисления дельт между циклами сбора. Обновляются каждый цикл, удаляются при отключении. |
-| `schema_version` | Однострочная служебная таблица с текущей версией схемы (сейчас `2`). |
+| `connection_events` | Append-only журнал событий из `openvpn.log` (`auth_failure`, `verify_error`, `tls_error`, `peer_init`, `reneg`, `disconnect`, `inactivity`). Та же retention, что и у `traffic_history`. |
+| `log_parse_state` | Per-server byte offset / inode основного лога OpenVPN, чтобы парсинг был инкрементальным и переживал рестарты/ротацию. |
+| `schema_version` | Однострочная служебная таблица с текущей версией схемы (сейчас `3`). |
 
 **Учёт трафика.** Трафик всегда хранится как дельты, не как накопленные значения. Короткие сессии учитываются по эвристике «только что подключилась» (возраст < 2 × `UPDATE_INTERVAL`). Сбросы счётчиков OpenVPN и переподключения клиента на тот же `ip:port` детектируются автоматически.
 
