@@ -33,6 +33,18 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def iso_utc(ts: Optional[str]) -> Optional[str]:
+    """Mark a naive 'YYYY-MM-DD HH:MM:SS' SQLite timestamp as explicit UTC.
+
+    Without a 'Z'/offset suffix, JS `new Date(...)` parses these strings as
+    local time, silently shifting every displayed timestamp by the viewer's
+    UTC offset. API responses consumed by the frontend must go through this.
+    """
+    if not ts:
+        return ts
+    return ts.replace(' ', 'T', 1) + ('Z' if not ts.endswith('Z') else '')
+
+
 # Schema version managed via a dedicated `schema_version` table.
 # Bump when the schema changes and add a migration step in DatabaseManager._migrate.
 SCHEMA_VERSION = 3
@@ -2182,7 +2194,7 @@ def api_active_sessions():
             'virtual_address': s['virtual_address'] or 'N/A',
             'bytes_received': s['bytes_received'],
             'bytes_sent': s['bytes_sent'],
-            'connected_since': s['connected_since'],
+            'connected_since': iso_utc(s['connected_since']),
             'duration': duration_str,
             'total_traffic': f"{traffic_mb} MB",
             'download_mb': round(s['bytes_received'] / (1024**2), 2),
@@ -2221,7 +2233,7 @@ def api_user_stats():
                 'sessions_week': s.get('sessions_week', 0),
                 'total_time': time_str,
                 'total_traffic_gb': traffic_gb,
-                'last_seen': s['last_seen'],
+                'last_seen': iso_utc(s['last_seen']),
                 'status': s['current_status'],
                 'bytes_sent': bytes_sent,
                 'bytes_received': bytes_received,
@@ -2324,8 +2336,8 @@ def api_user_sessions(username):
                 'bytes_sent': s['bytes_sent'],
                 'download_mb': round(s['bytes_received'] / (1024**2), 2),
                 'upload_mb': round(s['bytes_sent'] / (1024**2), 2),
-                'connected_since': s['connected_since'],
-                'disconnected_at': s.get('disconnected_at'),
+                'connected_since': iso_utc(s['connected_since']),
+                'disconnected_at': iso_utc(s.get('disconnected_at')),
                 'duration': duration_str,
                 'status': s['status'],
                 # Log-derived fields (added in schema v3). They are nullable
