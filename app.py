@@ -14,7 +14,9 @@ import csv
 import io
 import hmac
 import secrets
+from contextlib import contextmanager
 from functools import wraps
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -47,7 +49,15 @@ def iso_utc(ts: Optional[str]) -> Optional[str]:
 
 # Schema version managed via a dedicated `schema_version` table.
 # Bump when the schema changes and add a migration step in DatabaseManager._migrate.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+# Timestamp format used for SQLite TIMESTAMP columns written from Python.
+TS_FMT = '%Y-%m-%d %H:%M:%S'
+
+
+def ts_str(dt: datetime) -> str:
+    """Format a naive UTC datetime the way SQLite CURRENT_TIMESTAMP does."""
+    return dt.strftime(TS_FMT)
 
 
 def _format_chart_labels(time_slots: List[str], interval_name: str) -> List[str]:
@@ -72,7 +82,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('/app/data/openvpn_stats.log') if os.path.exists('/app/data') else logging.NullHandler()
+        # Rotate the on-disk log: the collector writes a few lines per cycle
+        # per server, which adds up to hundreds of MB over months otherwise.
+        RotatingFileHandler('/app/data/openvpn_stats.log', maxBytes=10 * 1024 * 1024, backupCount=3)
+        if os.path.exists('/app/data') else logging.NullHandler()
     ]
 )
 logger = logging.getLogger(__name__)
@@ -221,9 +234,29 @@ class DatabaseManager:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
-    
+
+    @contextmanager
+    def _tx(self, conn: Optional[sqlite3.Connection] = None):
+        """Yield a connection to work on.
+
+        With `conn` given, the caller owns the transaction: nothing is
+        committed or closed here, so a whole collector cycle can run as one
+        transaction. Without it, a fresh connection is opened, committed on
+        success (rolled back on error) and always closed — the plain
+        `with sqlite3.connect(...) as conn` idiom commits but never closes.
+        """
+        if conn is not None:
+            yield conn
+            return
+        own = self._connect()
+        try:
+            with own:
+                yield own
+        finally:
+            own.close()
+
     def init_db(self):
-        with self._connect() as conn:
+        with self._tx() as conn:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS schema_version (
                     version INTEGER NOT NULL
@@ -248,6 +281,7 @@ class DatabaseManager:
                     disconnect_reason TEXT,
                     tls_handshake_ms INTEGER,
                     reneg_count INTEGER DEFAULT 0,
+                    last_seen TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -339,11 +373,11 @@ class DatabaseManager:
                             'idx_unique_active_session'):
                 conn.execute(f'DROP INDEX IF EXISTS {old_idx}')
 
-            conn.execute('''
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_session_v2
-                ON sessions(username, server_name, real_address, real_address_port)
-                WHERE disconnected_at IS NULL
-            ''')
+            # Session identity (schema v4): one OpenVPN session is uniquely
+            # identified by (user, endpoint, connected_since) — a reconnect on
+            # the same ip:port always carries a new connected_since. The
+            # index is created in _migrate, after the legacy v2 index has
+            # been dropped.
 
             conn.execute('CREATE INDEX IF NOT EXISTS idx_traffic_server_time ON traffic_history(server_name, timestamp)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_traffic_user_time ON traffic_history(username, timestamp)')
@@ -415,45 +449,142 @@ class DatabaseManager:
                         logger.info(f"Migration v3: added column sessions.{col}")
                     except sqlite3.OperationalError as e:
                         logger.warning(f"Migration v3: could not add sessions.{col}: {e}")
-    
-    def save_session(self, session: VPNSession):
-        """Insert or update a session row.
 
-        Handles the edge case where a client reconnects on the same
-        (real_address, real_address_port) tuple before the previous session
-        was marked as disconnected: OpenVPN resets byte counters to zero on a
-        fresh session, so if the incoming values are lower than the stored
-        ones we close the old row first and insert a new one instead of
-        overwriting (and losing) the previous traffic.
+        if from_version < 4:
+            # v4: session identity includes connected_since; sessions get a
+            # last_seen column; session_traffic_state keys are rebuilt in the
+            # new format so traffic deltas survive the upgrade.
+            session_cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()}
+            if 'last_seen' not in session_cols:
+                conn.execute('ALTER TABLE sessions ADD COLUMN last_seen TIMESTAMP')
+                logger.info("Migration v4: added column sessions.last_seen")
+            conn.execute('DROP INDEX IF EXISTS idx_unique_active_session_v2')
+
+            rebuilt = conn.execute('DELETE FROM session_traffic_state').rowcount
+            conn.execute('''
+                INSERT INTO session_traffic_state
+                    (session_key, server_name, username, bytes_in, bytes_out, updated_at)
+                SELECT server_name || '|' || username || '|' || real_address || '|'
+                           || real_address_port || '|' || connected_since,
+                       server_name, username, bytes_received, bytes_sent, CURRENT_TIMESTAMP
+                FROM sessions
+                WHERE disconnected_at IS NULL
+            ''')
+            logger.info(f"Migration v4: rebuilt {rebuilt} session_traffic_state rows with v4 keys")
+
+        # Unique identity of an active session. Created here (not in
+        # init_db) so it comes after the v4 migration dropped the old index.
+        conn.execute('''
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_session_v3
+            ON sessions(username, server_name, real_address, real_address_port, connected_since)
+            WHERE disconnected_at IS NULL
+        ''')
+
+    def save_session(self, session: VPNSession, seen_at: Optional[datetime] = None,
+                     conn: Optional[sqlite3.Connection] = None):
+        """Insert or update the row for one OpenVPN session.
+
+        Identity is (user, server, ip, port, connected_since): OpenVPN never
+        reuses connected_since for a new connection on the same endpoint, so
+        a reconnect naturally becomes a new row while the previous one is
+        closed. If a closed row with the same identity exists (i.e. we
+        wrongly declared it disconnected — a transient status-file read
+        failure in an older version of this code), it is reopened instead of
+        inserting a duplicate: a split row would double-count the cumulative
+        byte counters in user_stats and in the summary.
         """
-        with self._connect() as conn:
+        connected_since = ts_str(session.connected_since)
+        seen = ts_str(seen_at or utcnow())
+        with self._tx(conn) as conn:
+            ident = (session.username, session.server_name,
+                     session.real_address, session.real_address_port, connected_since)
+
             existing = conn.execute('''
-                SELECT id, bytes_received, bytes_sent, connected_since FROM sessions
-                WHERE username = ? AND server_name = ? AND real_address = ? AND real_address_port = ?
-                AND disconnected_at IS NULL
-            ''', (session.username, session.server_name, session.real_address, session.real_address_port)).fetchone()
+                SELECT id FROM sessions
+                WHERE username = ? AND server_name = ? AND real_address = ?
+                  AND real_address_port = ? AND connected_since = ?
+                  AND disconnected_at IS NULL
+            ''', ident).fetchone()
 
-            reconnect_detected = False
-            if existing and session.disconnected_at is None:
-                _, old_in, old_out, _ = existing
-                if session.bytes_received < old_in or session.bytes_sent < old_out:
-                    reconnect_detected = True
+            if existing is None and session.disconnected_at is None:
+                # Same identity but already closed → reopen rather than split.
+                closed = conn.execute('''
+                    SELECT id FROM sessions
+                    WHERE username = ? AND server_name = ? AND real_address = ?
+                      AND real_address_port = ? AND connected_since = ?
+                      AND disconnected_at IS NOT NULL
+                      AND bytes_received <= ? AND bytes_sent <= ?
+                    ORDER BY id DESC LIMIT 1
+                ''', ident + (session.bytes_received, session.bytes_sent)).fetchone()
+                if closed is not None:
+                    conn.execute('''
+                        UPDATE sessions SET disconnected_at = NULL, session_duration = NULL,
+                                            disconnect_reason = NULL
+                        WHERE id = ?
+                    ''', (closed[0],))
+                    logger.info(
+                        f"[{session.server_name}] Session id={closed[0]} for "
+                        f"{session.username} reappeared in the status file — reopened"
+                    )
+                    existing = closed
 
-            if reconnect_detected:
-                close_ts = utcnow()
-                conn.execute('''
-                    UPDATE sessions SET
-                        disconnected_at = ?,
-                        session_duration = CAST(strftime('%s', ?) AS INTEGER) - CAST(strftime('%s', connected_since) AS INTEGER)
-                    WHERE id = ?
-                ''', (close_ts, close_ts, existing[0]))
-                logger.info(
-                    f"[{session.server_name}] Counter drop on same endpoint "
-                    f"({session.real_address}:{session.real_address_port}) for "
-                    f"{session.username} — closed old session id={existing[0]} "
-                    f"and creating a new one"
+            if existing is None and session.disconnected_at is None:
+                # A different connected_since on the same endpoint means the
+                # client reconnected before we saw the old session vanish.
+                # Close the old row(s) now; the new one is inserted below.
+                close_ts = seen
+                stale = conn.execute('''
+                    SELECT id, connected_since, bytes_received, bytes_sent FROM sessions
+                    WHERE username = ? AND server_name = ? AND real_address = ?
+                      AND real_address_port = ? AND disconnected_at IS NULL
+                ''', ident[:4]).fetchall()
+
+                # Upgrade path: rows written before the timezone fix carry
+                # connected_since in the OpenVPN host's local time. The same
+                # live session now shows up with connected_since shifted by
+                # a whole number of quarter hours and counters that kept
+                # growing — move the row to its corrected identity instead
+                # of closing it (a split would double-count its bytes).
+                if len(stale) == 1:
+                    old_id, old_cs, old_in, old_out = stale[0]
+                    try:
+                        shift = abs((datetime.fromisoformat(old_cs) - session.connected_since).total_seconds())
+                    except ValueError:
+                        shift = 0
+                    if (shift > 0 and shift % 900 == 0 and shift <= 14 * 3600
+                            and session.bytes_received >= old_in and session.bytes_sent >= old_out):
+                        conn.execute('UPDATE sessions SET connected_since = ? WHERE id = ?',
+                                     (connected_since, old_id))
+                        logger.info(
+                            f"[{session.server_name}] Session id={old_id} for {session.username}: "
+                            f"connected_since corrected {old_cs} -> {connected_since} (timezone fix)"
+                        )
+                        existing = (old_id,)
+                        stale = []
+
+                for (old_id, _cs, _in, _out) in stale:
+                    conn.execute('''
+                        UPDATE sessions SET
+                            disconnected_at = ?,
+                            session_duration = CAST(strftime('%s', ?) AS INTEGER)
+                                             - CAST(strftime('%s', connected_since) AS INTEGER)
+                        WHERE id = ?
+                    ''', (close_ts, close_ts, old_id))
+                    logger.info(
+                        f"[{session.server_name}] Reconnect on the same endpoint "
+                        f"({session.real_address}:{session.real_address_port}) for "
+                        f"{session.username} — closed old session id={old_id}"
+                    )
+
+            if existing is None and session.disconnected_at is not None:
+                # Closing a session we never recorded as active: nothing to
+                # close, and inserting a closed row would invent a session.
+                logger.warning(
+                    f"[{session.server_name}] No active row to close for "
+                    f"{session.username}@{session.real_address}:{session.real_address_port} "
+                    f"(connected {connected_since})"
                 )
-                existing = None
+                return
 
             if existing:
                 conn.execute('''
@@ -462,14 +593,17 @@ class DatabaseManager:
                         bytes_sent = ?,
                         virtual_address = ?,
                         disconnected_at = ?,
-                        session_duration = ?
+                        session_duration = ?,
+                        last_seen = CASE WHEN ? IS NULL THEN ? ELSE last_seen END
                     WHERE id = ?
                 ''', (
                     session.bytes_received,
                     session.bytes_sent,
                     session.virtual_address,
-                    session.disconnected_at,
+                    ts_str(session.disconnected_at) if session.disconnected_at else None,
                     session.duration_seconds if session.disconnected_at else None,
+                    ts_str(session.disconnected_at) if session.disconnected_at else None,
+                    seen,
                     existing[0]
                 ))
             else:
@@ -477,8 +611,8 @@ class DatabaseManager:
                     INSERT INTO sessions (
                         username, server_name, real_address, real_address_port, virtual_address,
                         bytes_received, bytes_sent, connected_since,
-                        disconnected_at, session_duration
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        disconnected_at, session_duration, last_seen
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     session.username,
                     session.server_name,
@@ -487,24 +621,43 @@ class DatabaseManager:
                     session.virtual_address,
                     session.bytes_received,
                     session.bytes_sent,
-                    session.connected_since,
-                    session.disconnected_at,
-                    session.duration_seconds if session.disconnected_at else None
+                    connected_since,
+                    ts_str(session.disconnected_at) if session.disconnected_at else None,
+                    session.duration_seconds if session.disconnected_at else None,
+                    seen,
                 ))
 
-            conn.commit()
-    
+    def close_session(self, session_id: int, closed_at: datetime,
+                      conn: Optional[sqlite3.Connection] = None):
+        """Mark a session row as disconnected at `closed_at` (naive UTC)."""
+        closed = ts_str(closed_at)
+        with self._tx(conn) as conn:
+            conn.execute('''
+                UPDATE sessions SET
+                    disconnected_at = ?,
+                    session_duration = MAX(0, CAST(strftime('%s', ?) AS INTEGER)
+                                            - CAST(strftime('%s', connected_since) AS INTEGER))
+                WHERE id = ? AND disconnected_at IS NULL
+            ''', (closed, closed, session_id))
+
     @staticmethod
-    def _session_key(server_name: str, username: str, real_address: str, real_address_port: str) -> str:
+    def _session_key(server_name: str, username: str, real_address: str,
+                     real_address_port: str, connected_since) -> str:
         """Build a globally-unique session identifier.
 
-        The `server_name` prefix prevents collisions when the same user
-        connects from the same `ip:port` to two different servers (theoretical
-        but possible behind NAT), which would otherwise mix their deltas.
+        `server_name` prevents collisions when the same user connects from
+        the same `ip:port` to two servers; `connected_since` separates a
+        reconnect on the same endpoint from the session it replaced, so the
+        new session starts from its own (zero-based) counters instead of
+        being read as a "counter reset".
         """
-        return f"{server_name}|{username}|{real_address}|{real_address_port}"
+        if isinstance(connected_since, datetime):
+            connected_since = ts_str(connected_since)
+        return f"{server_name}|{username}|{real_address}|{real_address_port}|{connected_since}"
 
-    def save_traffic_snapshot(self, server_name: str, sessions: List[VPNSession]):
+    def save_traffic_snapshot(self, server_name: str, sessions: List[VPNSession],
+                              conn: Optional[sqlite3.Connection] = None,
+                              now: Optional[datetime] = None):
         """Compute traffic deltas for the current cycle and persist them.
 
         * Per-session cumulative counters are kept in `session_traffic_state`
@@ -521,7 +674,7 @@ class DatabaseManager:
         observed before (e.g. after a collector restart) start from a zero
         baseline to avoid spurious spikes.
         """
-        with self._connect() as conn:
+        with self._tx(conn) as conn:
             prev_rows = conn.execute('''
                 SELECT session_key, bytes_in, bytes_out
                 FROM session_traffic_state
@@ -537,34 +690,58 @@ class DatabaseManager:
             state_upserts: List[Tuple[str, str, str, int, int]] = []
             current_keys = set()
 
-            now = utcnow()
+            # `now` is the OpenVPN snapshot time when the caller has it, so
+            # session age is measured on the same clock as connected_since.
+            now = now or utcnow()
             fresh_threshold = UPDATE_INTERVAL * 2
 
             for session in sessions:
                 key = self._session_key(
-                    server_name, session.username, session.real_address, session.real_address_port
+                    server_name, session.username, session.real_address,
+                    session.real_address_port, session.connected_since,
                 )
                 current_keys.add(key)
                 prev = prev_state.get(key)
 
+                if prev is None:
+                    # Upgrade path (see save_session): a state row for the
+                    # same endpoint whose connected_since differs by whole
+                    # quarter hours and whose counters have not gone
+                    # backwards is this very session recorded in local
+                    # time. Adopt it as the baseline so the upgrade minute
+                    # is not lost from the charts.
+                    prefix = key.rsplit('|', 1)[0] + '|'
+                    for old_key, (o_in, o_out) in prev_state.items():
+                        if not old_key.startswith(prefix) or old_key in current_keys:
+                            continue
+                        try:
+                            shift = abs((datetime.fromisoformat(old_key[len(prefix):])
+                                         - session.connected_since).total_seconds())
+                        except ValueError:
+                            continue
+                        if (shift > 0 and shift % 900 == 0 and shift <= 14 * 3600
+                                and session.bytes_received >= o_in and session.bytes_sent >= o_out):
+                            prev = (o_in, o_out)
+                            current_keys.add(old_key)  # keep it from being deleted as stale...
+                            prev_state.pop(old_key, None)  # ...but do not match it twice
+                            break
+
                 if prev is not None:
                     prev_in, prev_out = prev
-                    if session.bytes_received >= prev_in:
+                    if session.bytes_received >= prev_in and session.bytes_sent >= prev_out:
                         delta_in = session.bytes_received - prev_in
-                    else:
-                        delta_in = session.bytes_received
-                        logger.info(
-                            f"[{server_name}] Counter reset for {session.username} "
-                            f"(IN: {prev_in} -> {session.bytes_received})"
-                        )
-
-                    if session.bytes_sent >= prev_out:
                         delta_out = session.bytes_sent - prev_out
                     else:
+                        # Counters only go backwards when OpenVPN started a
+                        # new session under the same key (should not happen
+                        # now that connected_since is part of the key, kept
+                        # as a safety net). Both directions restart together.
+                        delta_in = session.bytes_received
                         delta_out = session.bytes_sent
                         logger.info(
                             f"[{server_name}] Counter reset for {session.username} "
-                            f"(OUT: {prev_out} -> {session.bytes_sent})"
+                            f"(IN: {prev_in} -> {session.bytes_received}, "
+                            f"OUT: {prev_out} -> {session.bytes_sent})"
                         )
                 else:
                     session_age = (now - session.connected_since).total_seconds()
@@ -627,63 +804,68 @@ class DatabaseManager:
                 f"Δ{total_delta_out/(1024**2):.2f}MB out, {active_users} unique users"
             )
 
-            conn.commit()
-    
-    def update_user_stats(self, username: str, server_name: str):
-        with self._connect() as conn:
-            now = utcnow()
-            today = now.strftime('%Y-%m-%d')
-            week_ago = (now - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
-            
-            stats = conn.execute('''
-                SELECT 
-                    COUNT(*) as total_sessions,
+    def refresh_user_stats(self, server_name: str, usernames, conn: Optional[sqlite3.Connection] = None):
+        """Recompute `user_stats` rows for the given users of one server.
+
+        One statement for the whole set: the collector calls this once per
+        cycle with every user that was active or just disconnected, instead
+        of one aggregate query + one write per *session*.
+        """
+        usernames = sorted(set(usernames))
+        if not usernames:
+            return
+        placeholders = ','.join('?' * len(usernames))
+        with self._tx(conn) as conn:
+            conn.execute(f'''
+                INSERT OR REPLACE INTO user_stats (
+                    username, server_name, total_sessions, total_time_seconds,
+                    total_bytes_sent, total_bytes_received,
+                    last_seen, current_status, updated_at
+                )
+                SELECT
+                    username, server_name,
+                    COUNT(*),
                     COALESCE(SUM(
                         CASE WHEN session_duration IS NOT NULL THEN session_duration
-                        ELSE strftime('%s', 'now') - strftime('%s', connected_since)
+                        ELSE CAST(strftime('%s', 'now') AS INTEGER)
+                           - CAST(strftime('%s', connected_since) AS INTEGER)
                         END
-                    ), 0) as total_time,
-                    COALESCE(SUM(bytes_sent), 0) as total_sent,
-                    COALESCE(SUM(bytes_received), 0) as total_received,
-                    MAX(COALESCE(disconnected_at, connected_since)) as last_seen,
-                    SUM(CASE WHEN disconnected_at IS NULL THEN 1 ELSE 0 END) as online_count,
-                    SUM(CASE WHEN DATE(connected_since) = ? THEN 1 ELSE 0 END) as sessions_today,
-                    SUM(CASE WHEN connected_since >= ? THEN 1 ELSE 0 END) as sessions_week
+                    ), 0),
+                    COALESCE(SUM(bytes_sent), 0),
+                    COALESCE(SUM(bytes_received), 0),
+                    MAX(COALESCE(disconnected_at, last_seen, connected_since)),
+                    CASE WHEN SUM(disconnected_at IS NULL) > 0 THEN 'online' ELSE 'offline' END,
+                    CURRENT_TIMESTAMP
                 FROM sessions
-                WHERE username = ? AND server_name = ?
-            ''', (today, week_ago, username, server_name)).fetchone()
-            
-            if stats and stats[0] > 0:
-                conn.execute('''
-                    INSERT OR REPLACE INTO user_stats (
-                        username, server_name, total_sessions, total_time_seconds,
-                        total_bytes_sent, total_bytes_received,
-                        last_seen, current_status, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ''', (
-                    username, server_name,
-                    stats[0], stats[1], stats[2], stats[3], stats[4],
-                    'online' if stats[5] > 0 else 'offline'
-                ))
-                conn.commit()
-    
-    def get_active_sessions(self, server_name: Optional[str] = None) -> List[Dict]:
-        with self._connect() as conn:
-            conn.row_factory = sqlite3.Row
-            
+                WHERE server_name = ? AND username IN ({placeholders})
+                GROUP BY username, server_name
+            ''', [server_name] + usernames)
+
+    def update_user_stats(self, username: str, server_name: str, conn: Optional[sqlite3.Connection] = None):
+        """Single-user convenience wrapper around refresh_user_stats."""
+        self.refresh_user_stats(server_name, [username], conn)
+
+    def get_active_sessions(self, server_name: Optional[str] = None,
+                            conn: Optional[sqlite3.Connection] = None) -> List[Dict]:
+        with self._tx(conn) as conn:
+            # Row factory on a cursor, not the connection: the collector
+            # shares one connection across the whole cycle.
+            cur = conn.cursor()
+            cur.row_factory = sqlite3.Row
+
             if server_name:
-                rows = conn.execute('''
+                rows = cur.execute('''
                     SELECT * FROM sessions
                     WHERE disconnected_at IS NULL AND server_name = ?
                     ORDER BY connected_since DESC
                 ''', (server_name,)).fetchall()
             else:
-                rows = conn.execute('''
+                rows = cur.execute('''
                     SELECT * FROM sessions
                     WHERE disconnected_at IS NULL
                     ORDER BY server_name, connected_since DESC
                 ''').fetchall()
-            
+
             return [dict(row) for row in rows]
     
     def get_user_stats(self, server_name: Optional[str] = None, limit: Optional[int] = 50,
@@ -693,7 +875,7 @@ class DatabaseManager:
         Pass `limit=None` to fetch every matching row (used by CSV/JSON
         exports, which must not silently truncate the dataset).
         """
-        with self._connect() as conn:
+        with self._tx() as conn:
             conn.row_factory = sqlite3.Row
 
             now = utcnow()
@@ -778,7 +960,7 @@ class DatabaseManager:
     
     def get_traffic_history(self, hours: float = 24, server_name: Optional[str] = None) -> Dict:
         """Aggregate delta traffic for the main chart (all users combined)."""
-        with self._connect() as conn:
+        with self._tx() as conn:
             since = utcnow() - timedelta(hours=hours)
 
             if hours <= 6:
@@ -850,7 +1032,7 @@ class DatabaseManager:
         governed by the regular `TRAFFIC_HISTORY_RETENTION_DAYS` (not the
         previous 2-hour per-session cleanup).
         """
-        with self._connect() as conn:
+        with self._tx() as conn:
             since = utcnow() - timedelta(hours=hours)
 
             if hours <= 6:
@@ -881,22 +1063,27 @@ class DatabaseManager:
 
             datasets: Dict[str, Dict] = {}
 
+            # One query for all requested users instead of one per user.
+            placeholders = ','.join('?' * len(usernames))
+            params: list = [since] + list(usernames)
+            if server_name:
+                params.append(server_name)
+            rows = conn.execute(f'''
+                SELECT username,
+                       strftime('{interval_format}', timestamp) AS time_slot,
+                       COALESCE(SUM(bytes_in), 0),
+                       COALESCE(SUM(bytes_out), 0)
+                FROM traffic_history
+                WHERE timestamp > ? AND username IN ({placeholders}) {server_filter}
+                GROUP BY username, time_slot
+                HAVING time_slot IS NOT NULL
+            ''', params).fetchall()
+            deltas_by_user: Dict[str, Dict[str, Tuple[int, int]]] = {}
+            for uname, slot, d_in, d_out in rows:
+                deltas_by_user.setdefault(uname, {})[slot] = (d_in, d_out)
+
             for username in usernames:
-                params: list = [since, username]
-                if server_name:
-                    params.append(server_name)
-
-                rows = conn.execute(f'''
-                    SELECT strftime('{interval_format}', timestamp) AS time_slot,
-                           COALESCE(SUM(bytes_in), 0),
-                           COALESCE(SUM(bytes_out), 0)
-                    FROM traffic_history
-                    WHERE timestamp > ? AND username = ? {server_filter}
-                    GROUP BY time_slot
-                    HAVING time_slot IS NOT NULL
-                ''', params).fetchall()
-
-                deltas_by_slot = {r[0]: (r[1], r[2]) for r in rows}
+                deltas_by_slot = deltas_by_user.get(username, {})
 
                 inbound = []
                 outbound = []
@@ -920,7 +1107,7 @@ class DatabaseManager:
     
     def get_user_sessions_list(self, username: str, server_name: Optional[str] = None) -> List[Dict]:
         """Get list of sessions for a user (active and recent)"""
-        with self._connect() as conn:
+        with self._tx() as conn:
             conn.row_factory = sqlite3.Row
             
             params = [username]
@@ -988,6 +1175,7 @@ class DatabaseManager:
                     session['username'],
                     session['real_address'],
                     session['real_address_port'],
+                    session['connected_since'],
                 )
                 sessions.append(session)
 
@@ -1008,7 +1196,7 @@ class DatabaseManager:
           from deleted rows.
         """
         try:
-            with self._connect() as conn:
+            with self._tx() as conn:
                 sessions_cutoff = utcnow() - timedelta(days=RETENTION_DAYS)
                 traffic_cutoff = utcnow() - timedelta(days=TRAFFIC_HISTORY_RETENTION_DAYS)
 
@@ -1111,19 +1299,22 @@ class DatabaseManager:
 
     # ---- Log-parsing helpers --------------------------------------------
 
-    def get_log_parse_state(self, server_name: str) -> Optional[Dict]:
+    def get_log_parse_state(self, server_name: str,
+                            conn: Optional[sqlite3.Connection] = None) -> Optional[Dict]:
         """Return the persisted parser state for `server_name` or None."""
-        with self._connect() as conn:
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
+        with self._tx(conn) as conn:
+            cur = conn.cursor()
+            cur.row_factory = sqlite3.Row
+            row = cur.execute(
                 'SELECT * FROM log_parse_state WHERE server_name = ?',
                 (server_name,),
             ).fetchone()
             return dict(row) if row else None
 
-    def save_log_parse_state(self, server_name: str, state: Dict):
+    def save_log_parse_state(self, server_name: str, state: Dict,
+                             conn: Optional[sqlite3.Connection] = None):
         """Upsert the parser state for `server_name`."""
-        with self._connect() as conn:
+        with self._tx(conn) as conn:
             conn.execute('''
                 INSERT INTO log_parse_state
                     (server_name, log_path, inode, size, offset, last_parsed_at)
@@ -1141,9 +1332,8 @@ class DatabaseManager:
                 state.get('size', 0),
                 state.get('offset', 0),
             ))
-            conn.commit()
 
-    def save_log_events(self, events: List['LogEvent']):
+    def save_log_events(self, events: List['LogEvent'], conn: Optional[sqlite3.Connection] = None):
         """Persist parsed events and apply their side effects to `sessions`.
 
         Side effects:
@@ -1155,7 +1345,7 @@ class DatabaseManager:
         """
         if not events:
             return
-        with self._connect() as conn:
+        with self._tx(conn) as conn:
             event_rows = [
                 (
                     ev.server_name,
@@ -1186,7 +1376,10 @@ class DatabaseManager:
                     # Match the most recent matching session whose
                     # disconnected_at is within the time window. If none has
                     # disconnected_at yet, pick the active one — the next
-                    # status snapshot will close it.
+                    # status snapshot will close it. In both cases the event
+                    # must not predate the session: when the log is replayed
+                    # from the start, an old SIGTERM for the same ip:port
+                    # must not be pinned to a session that started later.
                     conn.execute('''
                         UPDATE sessions SET disconnect_reason = ?
                         WHERE id = (
@@ -1194,6 +1387,8 @@ class DatabaseManager:
                             WHERE server_name = ? AND real_address = ?
                               AND real_address_port = ?
                               AND disconnect_reason IS NULL
+                              AND CAST(strftime('%s', connected_since) AS INTEGER)
+                                  <= CAST(strftime('%s', ?) AS INTEGER) + ?
                               AND (
                                 disconnected_at IS NULL
                                 OR ABS(CAST(strftime('%s', disconnected_at) AS INTEGER)
@@ -1205,7 +1400,8 @@ class DatabaseManager:
                     ''', (
                         ev.reason_text or ev.event_type,
                         ev.server_name, ev.real_address, ev.real_address_port,
-                        ev.timestamp, window,
+                        ts_str(ev.timestamp), window,
+                        ts_str(ev.timestamp), window,
                     ))
 
                 elif ev.event_type == 'peer_init' and ev.extra and ev.extra.get('handshake_ms') is not None:
@@ -1225,7 +1421,7 @@ class DatabaseManager:
                     ''', (
                         ev.extra['handshake_ms'],
                         ev.server_name, ev.real_address, ev.real_address_port,
-                        ev.timestamp, window, ev.timestamp,
+                        ts_str(ev.timestamp), window, ts_str(ev.timestamp),
                     ))
 
                 elif ev.event_type == 'reneg':
@@ -1236,12 +1432,13 @@ class DatabaseManager:
                             WHERE server_name = ? AND real_address = ?
                               AND real_address_port = ?
                               AND disconnected_at IS NULL
+                              AND CAST(strftime('%s', connected_since) AS INTEGER)
+                                  <= CAST(strftime('%s', ?) AS INTEGER) + ?
                             ORDER BY connected_since DESC
                             LIMIT 1
                         )
-                    ''', (ev.server_name, ev.real_address, ev.real_address_port))
-
-            conn.commit()
+                    ''', (ev.server_name, ev.real_address, ev.real_address_port,
+                          ts_str(ev.timestamp), window))
 
     def get_auth_failures(self, server_name: Optional[str] = None,
                           hours: int = 24, limit: int = 200) -> List[Dict]:
@@ -1253,7 +1450,7 @@ class DatabaseManager:
             server_filter = ' AND server_name = ?'
             params.append(server_name)
         params.append(limit)
-        with self._connect() as conn:
+        with self._tx() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(f'''
                 SELECT id, server_name, event_type, username,
@@ -1277,7 +1474,7 @@ class DatabaseManager:
         if server_name:
             server_filter = ' AND server_name = ?'
             params.append(server_name)
-        with self._connect() as conn:
+        with self._tx() as conn:
             row = conn.execute(f'''
                 SELECT COUNT(*) AS total,
                        COUNT(DISTINCT real_address) AS unique_ips
@@ -1307,7 +1504,7 @@ class DatabaseManager:
             params.append(server_name)
         where_sql = ('WHERE ' + ' AND '.join(where)) if where else ''
         params.append(limit)
-        with self._connect() as conn:
+        with self._tx() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(f'''
                 SELECT id, server_name, event_type, username,
@@ -1322,7 +1519,7 @@ class DatabaseManager:
 
     def get_users_list(self, server_name: Optional[str] = None) -> List[Dict]:
         """Get list of all users with online status"""
-        with self._connect() as conn:
+        with self._tx() as conn:
             params: list = []
             server_filter = ""
             if server_name:
@@ -1342,7 +1539,7 @@ class DatabaseManager:
     
     def get_summary(self, server_name: Optional[str] = None, period: str = 'all') -> Dict:
         """Get dashboard summary statistics"""
-        with self._connect() as conn:
+        with self._tx() as conn:
             now = utcnow()
             today = now.strftime('%Y-%m-%d')
             server_filter = " AND server_name = ?" if server_name else ""
@@ -1361,25 +1558,33 @@ class DatabaseManager:
                 WHERE 1=1 {server_filter}
             ''', summary_params).fetchone()
 
-            traffic_period_filter = ""
             traffic_params: list = []
-            if server_name:
-                traffic_params.append(server_name)
-            if period == 'day':
-                traffic_period_filter = " AND DATE(connected_since) = ?"
-                traffic_params.append(today)
-            elif period in ('week', 'month'):
-                days = 7 if period == 'week' else 30
-                traffic_period_filter = " AND connected_since >= ?"
-                traffic_params.append(
-                    (now - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
-                )
-            
-            total_traffic = conn.execute(f'''
-                SELECT COALESCE(SUM(bytes_sent + bytes_received), 0)
-                FROM sessions
-                WHERE 1=1 {server_filter} {traffic_period_filter}
-            ''', traffic_params).fetchone()[0]
+            if period in ('day', 'week', 'month'):
+                # Period traffic comes from the delta rows, i.e. bytes that
+                # actually flowed inside the period. Summing session
+                # counters by connected_since would attribute a week-long
+                # session entirely to its start day and drop it from
+                # "today" even while it is still pushing traffic.
+                if period == 'day':
+                    period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                else:
+                    period_start = now - timedelta(days=7 if period == 'week' else 30)
+                traffic_params.append(ts_str(period_start))
+                if server_name:
+                    traffic_params.append(server_name)
+                total_traffic = conn.execute(f'''
+                    SELECT COALESCE(SUM(bytes_in + bytes_out), 0)
+                    FROM traffic_history
+                    WHERE username IS NULL AND timestamp >= ? {server_filter}
+                ''', traffic_params).fetchone()[0]
+            else:
+                if server_name:
+                    traffic_params.append(server_name)
+                total_traffic = conn.execute(f'''
+                    SELECT COALESCE(SUM(bytes_sent + bytes_received), 0)
+                    FROM sessions
+                    WHERE 1=1 {server_filter}
+                ''', traffic_params).fetchone()[0]
             
             return {
                 'active_users': row[0] or 0,
@@ -1422,23 +1627,51 @@ class OpenVPNParser:
         self.status_file = status_file
         self.server_name = server_name
         self._format_logged: Optional[int] = None
+        # Offset of the OpenVPN host's local clock from UTC, as observed in
+        # the last successfully parsed snapshot. OpenVPN writes every
+        # timestamp in the status file (and in openvpn.log) via localtime(),
+        # so this is what converts them to the UTC the database expects.
+        # Exact for status-version 2 (TIME line carries both the local
+        # string and the epoch); estimated for v1 (see _parse_v1).
+        self.tz_offset: Optional[timedelta] = None
+        # UTC time at which OpenVPN wrote the last parsed snapshot.
+        self.snapshot_time: Optional[datetime] = None
+        self._offset_logged: Optional[timedelta] = None
 
-    def parse_status_file(self) -> List[VPNSession]:
+    def parse_status_file(self) -> Optional[List[VPNSession]]:
+        """Return the sessions in the status file, or None when it could not
+        be read reliably.
+
+        None (as opposed to an empty list) tells the collector to skip the
+        cycle. OpenVPN rewrites the status file in place (truncate + write),
+        so a read can catch it empty or half-written; treating that as "no
+        clients" would close every session, split each one into two rows
+        and double-count their cumulative byte counters.
+        """
         if not os.path.exists(self.status_file):
             logger.warning(f"[{self.server_name}] Status file not found: {self.status_file}")
-            return []
+            return None
 
         try:
             with open(self.status_file, 'r') as f:
                 lines = f.readlines()
         except IOError as e:
             logger.error(f"[{self.server_name}] I/O error reading status file: {e}")
-            return []
+            return None
 
         version = self._detect_version(lines)
         if version != self._format_logged:
             logger.info(f"[{self.server_name}] status file format detected: status-version {version}")
             self._format_logged = version
+
+        # Both formats terminate with a bare END line; without it the file
+        # is still being written.
+        if not any(raw.strip() == 'END' for raw in lines):
+            logger.warning(
+                f"[{self.server_name}] Status file has no END marker "
+                f"({len(lines)} lines) — probably mid-rewrite, skipping this cycle"
+            )
+            return None
 
         try:
             if version == 2:
@@ -1451,13 +1684,37 @@ class OpenVPNParser:
                     f"(neither v1 nor v2). First non-empty line: "
                     f"{next((l.strip() for l in lines if l.strip()), '<empty>')!r}"
                 )
-                return []
+                return None
         except Exception as e:
             logger.error(f"[{self.server_name}] Unexpected error parsing status file: {e}")
-            return []
+            return None
 
-        logger.info(f"[{self.server_name}] Parsed {len(sessions)} sessions (status-version {version})")
+        if self.tz_offset is not None and self.tz_offset != self._offset_logged:
+            logger.info(
+                f"[{self.server_name}] OpenVPN host clock offset from UTC: "
+                f"{self.tz_offset.total_seconds() / 3600:+.2f} h "
+                f"({'exact, from TIME epoch' if version == 2 else 'estimated from Updated line'})"
+            )
+            self._offset_logged = self.tz_offset
+
+        logger.debug(f"[{self.server_name}] Parsed {len(sessions)} sessions (status-version {version})")
         return sessions
+
+    def _local_to_utc(self, local: datetime) -> datetime:
+        """Convert a localtime() string from OpenVPN to naive UTC."""
+        if self.tz_offset is None:
+            return local
+        return local - self.tz_offset
+
+    @staticmethod
+    def _parse_epoch(value: str) -> Optional[datetime]:
+        value = value.strip()
+        if value.isdigit():
+            try:
+                return datetime.fromtimestamp(int(value), tz=timezone.utc).replace(tzinfo=None)
+            except (OverflowError, OSError, ValueError):
+                return None
+        return None
 
     @classmethod
     def _detect_version(cls, lines: List[str]) -> Optional[int]:
@@ -1485,18 +1742,32 @@ class OpenVPNParser:
         return endpoint, 'unknown'
 
     @staticmethod
-    def _parse_dt(value: str) -> datetime:
-        """Parse `YYYY-MM-DD HH:MM:SS` from a status file. Falls back to now."""
+    def _parse_dt(value: str) -> Optional[datetime]:
+        """Parse `YYYY-MM-DD HH:MM:SS` (local time) from a status file."""
         try:
-            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-        except (ValueError, TypeError):
-            return utcnow()
+            return datetime.strptime(value.strip(), "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError, AttributeError):
+            return None
 
     # ----- status-version 2 ------------------------------------------------
 
     def _parse_v2(self, lines: List[str]) -> List[VPNSession]:
         sessions: List[VPNSession] = []
         routing_table: Dict[str, str] = {}
+
+        # TIME,<local string>,<epoch> comes before CLIENT_LIST; it gives the
+        # exact local-to-UTC offset of the OpenVPN host for this snapshot.
+        for raw in lines[:40]:
+            line = raw.strip()
+            if line.startswith('TIME,'):
+                parts = line.split(',')
+                if len(parts) >= 3:
+                    local = self._parse_dt(parts[1])
+                    epoch = self._parse_epoch(parts[2])
+                    if local is not None and epoch is not None:
+                        self.snapshot_time = epoch
+                        self.tz_offset = local - epoch
+                break
 
         for line_num, raw in enumerate(lines, 1):
             line = raw.strip()
@@ -1512,7 +1783,12 @@ class OpenVPNParser:
                     virtual_address = parts[3] or None
                     bytes_received = int(parts[5]) if parts[5].isdigit() else 0
                     bytes_sent = int(parts[6]) if parts[6].isdigit() else 0
-                    connected_since = self._parse_dt(parts[7])
+                    # Column 8 is "Connected Since (time_t)" — unambiguous
+                    # UTC. Column 7 is the same instant via localtime().
+                    connected_since = self._parse_epoch(parts[8]) if len(parts) > 8 else None
+                    if connected_since is None:
+                        local = self._parse_dt(parts[7])
+                        connected_since = self._local_to_utc(local) if local else utcnow()
 
                     sessions.append(VPNSession(
                         username=username,
@@ -1597,6 +1873,16 @@ class OpenVPNParser:
 
             if section == 'clients':
                 if line.startswith('Updated,'):
+                    # v1 has no epoch, so the host's UTC offset is estimated:
+                    # the snapshot is at most one status interval old and we
+                    # read it within one collector cycle, so rounding the
+                    # difference to 15 minutes recovers the zone offset.
+                    updated = self._parse_dt(line.split(',', 1)[1])
+                    if updated is not None:
+                        diff = (updated - utcnow()).total_seconds()
+                        quarter = 15 * 60
+                        self.tz_offset = timedelta(seconds=round(diff / quarter) * quarter)
+                        self.snapshot_time = updated - self.tz_offset
                     continue
                 lower = line.lower()
                 # Header line: detect by presence of well-known column names.
@@ -1611,7 +1897,8 @@ class OpenVPNParser:
                     ip, port = self._split_endpoint(endpoint)
                     bytes_received = int(parts[cols['bytes received']])
                     bytes_sent = int(parts[cols['bytes sent']])
-                    connected_since = self._parse_dt(parts[cols['connected since']])
+                    local = self._parse_dt(parts[cols['connected since']])
+                    connected_since = self._local_to_utc(local) if local else utcnow()
 
                     sessions.append(VPNSession(
                         username=cn,
@@ -1743,6 +2030,10 @@ class OpenVPNLogParser:
         self._pending_handshakes: Dict[Tuple[str, str], datetime] = {}
         self._handshake_prune_sec = 120
         self._missing_logged = False
+        # Local-to-UTC offset of the OpenVPN host; the collector copies it
+        # from the status parser each cycle. Log lines are written with
+        # localtime() just like the status file.
+        self.tz_offset: Optional[timedelta] = None
 
     @classmethod
     def _parse_timestamp(cls, line: str) -> Tuple[Optional[datetime], str]:
@@ -1779,7 +2070,10 @@ class OpenVPNLogParser:
         ts, rest = self._parse_timestamp(line)
         # Even if we couldn't parse the timestamp (verbose-syslog/custom
         # format) we still want to recognise the event — fall back to "now".
-        ts = ts or utcnow()
+        if ts is None:
+            ts = utcnow()
+        elif self.tz_offset is not None:
+            ts = ts - self.tz_offset
         self._prune_pending(ts)
 
         # ---- TLS auth failure -------------------------------------------
@@ -1922,8 +2216,24 @@ class OpenVPNLogParser:
                 'log_path': self.log_file, 'inode': None, 'size': 0, 'offset': 0,
             }
 
-        prev_inode = prev_state.get('inode') if prev_state else None
-        prev_offset = prev_state.get('offset', 0) if prev_state else 0
+        if prev_state is None or prev_state.get('inode') is None:
+            # First time we see this log: start tailing from its current end.
+            # Replaying the whole history would record stale events and,
+            # worse, pin week-old disconnect reasons and handshake times to
+            # whatever sessions happen to share an ip:port today.
+            logger.info(
+                f"[{self.server_name}] Starting to tail {self.log_file} "
+                f"from offset {stat.st_size} (history before this point is not imported)"
+            )
+            return [], {
+                'log_path': self.log_file,
+                'inode': stat.st_ino,
+                'size': stat.st_size,
+                'offset': stat.st_size,
+            }
+
+        prev_inode = prev_state.get('inode')
+        prev_offset = prev_state.get('offset', 0)
 
         # Detect rotation / truncation: inode changed or file shrank below
         # our last offset.
@@ -2020,62 +2330,100 @@ class MultiServerStatsCollector:
 
             try:
                 sessions = parser.parse_status_file()
-                db_active_sessions = self.db.get_active_sessions(server_name)
-
-                current_session_keys = {
-                    (s.username, s.real_address, s.real_address_port) for s in sessions
-                }
-
-                disconnected_sessions_data = [
-                    db_sess for db_sess in db_active_sessions
-                    if (
-                        db_sess['username'],
-                        db_sess['real_address'],
-                        db_sess.get('real_address_port', 'unknown'),
-                    ) not in current_session_keys
-                ]
-
-                # Always take a snapshot — the state machine handles empty
-                # sessions lists correctly (stale state rows will be cleared).
-                self.db.save_traffic_snapshot(server_name, sessions)
-
-                for session in sessions:
-                    self.db.save_session(session)
-                    self.db.update_user_stats(session.username, server_name)
-
-                now = utcnow()
-                disconnected_count = 0
-                for db_session in disconnected_sessions_data:
-                    disconnected_session = VPNSession(
-                        username=db_session['username'],
-                        real_address=db_session['real_address'],
-                        real_address_port=db_session.get('real_address_port', 'unknown'),
-                        virtual_address=db_session['virtual_address'],
-                        bytes_received=db_session['bytes_received'],
-                        bytes_sent=db_session['bytes_sent'],
-                        connected_since=datetime.fromisoformat(db_session['connected_since']),
-                        server_name=server_name,
-                        disconnected_at=now,
-                    )
-                    self.db.save_session(disconnected_session)
-                    self.db.update_user_stats(db_session['username'], server_name)
-                    disconnected_count += 1
-
-                # Log parsing runs *after* sessions are persisted so
-                # log-derived events (disconnect_reason, handshake_ms, reneg)
-                # have a row to attach to in the same cycle.
-                events_count = 0
+                if sessions is None:
+                    # Unreadable / half-written status file: keep every
+                    # session and every traffic baseline exactly as it is
+                    # and try again next cycle.
+                    logger.warning(f"[{server_name}] Skipping cycle: status file unavailable")
+                    continue
                 if log_parser is not None:
-                    try:
-                        prev_state = self.db.get_log_parse_state(server_name)
-                        events, new_state = log_parser.parse_incremental(prev_state)
-                        if events:
-                            self.db.save_log_events(events)
-                            events_count = len(events)
-                        if new_state and new_state.get('log_path'):
-                            self.db.save_log_parse_state(server_name, new_state)
-                    except Exception as e:
-                        logger.warning(f"[{server_name}] log parse failed: {e}")
+                    log_parser.tz_offset = parser.tz_offset
+
+                # Use OpenVPN's own clock (TIME line) for everything that is
+                # compared with connected_since: session age for the
+                # "fresh" rule, last_seen and the close time. Clock skew
+                # between the OpenVPN host and this container then cancels
+                # out. Fall back to our clock if the snapshot time is
+                # missing or implausible (more than a day off).
+                now = utcnow()
+                snap = parser.snapshot_time
+                if snap is not None and abs((snap - now).total_seconds()) <= 86400:
+                    now = snap
+                # One connection and one transaction per server per cycle,
+                # instead of two connections + commits per session.
+                with self.db._tx() as conn:
+                    db_active_sessions = self.db.get_active_sessions(server_name, conn=conn)
+
+                    current_session_keys = {
+                        (s.username, s.real_address, s.real_address_port, ts_str(s.connected_since))
+                        for s in sessions
+                    }
+                    disconnected_sessions_data = [
+                        db_sess for db_sess in db_active_sessions
+                        if (
+                            db_sess['username'],
+                            db_sess['real_address'],
+                            db_sess.get('real_address_port', 'unknown'),
+                            db_sess['connected_since'],
+                        ) not in current_session_keys
+                    ]
+
+                    self.db.save_traffic_snapshot(server_name, sessions, conn=conn, now=now)
+
+                    for session in sessions:
+                        self.db.save_session(session, seen_at=now, conn=conn)
+
+                    # Re-read after the upserts: save_session may have moved
+                    # a pre-v4 row to its corrected identity, and such a row
+                    # must not be closed as "disappeared".
+                    if disconnected_sessions_data:
+                        disconnected_sessions_data = [
+                            db_sess for db_sess in self.db.get_active_sessions(server_name, conn=conn)
+                            if (
+                                db_sess['username'],
+                                db_sess['real_address'],
+                                db_sess.get('real_address_port', 'unknown'),
+                                db_sess['connected_since'],
+                            ) not in current_session_keys
+                        ]
+
+                    disconnected_count = 0
+                    for db_session in disconnected_sessions_data:
+                        # Close at the time we last saw the session, unless
+                        # that was within the normal cycle jitter — then
+                        # "now" is the better estimate. After a collector
+                        # outage this keeps durations honest.
+                        last_seen = db_session.get('last_seen')
+                        closed_at = now
+                        if last_seen:
+                            try:
+                                last_seen_dt = datetime.fromisoformat(last_seen)
+                                if (now - last_seen_dt).total_seconds() > 2 * UPDATE_INTERVAL:
+                                    closed_at = last_seen_dt
+                            except ValueError:
+                                pass
+                        self.db.close_session(db_session['id'], closed_at, conn=conn)
+                        disconnected_count += 1
+
+                    touched_users = {s.username for s in sessions}
+                    touched_users.update(d['username'] for d in disconnected_sessions_data)
+                    self.db.refresh_user_stats(server_name, touched_users, conn=conn)
+
+                    # Log parsing runs *after* sessions are persisted so
+                    # log-derived events (disconnect_reason, handshake_ms,
+                    # reneg) have a row to attach to in the same cycle.
+                    events_count = 0
+                    if log_parser is not None:
+                        try:
+                            prev_state = self.db.get_log_parse_state(server_name, conn=conn)
+                            events, new_state = log_parser.parse_incremental(prev_state)
+                            if events:
+                                self.db.save_log_events(events, conn=conn)
+                                events_count = len(events)
+                            if new_state and new_state.get('log_path'):
+                                self.db.save_log_parse_state(server_name, new_state, conn=conn)
+                        except Exception as e:
+                            logger.warning(f"[{server_name}] log parse failed: {e}")
 
                 msg = (f"[{server_name}] Updated: {len(sessions)} active, "
                        f"{disconnected_count} disconnected")
@@ -2104,13 +2452,26 @@ class MultiServerStatsCollector:
     
     def run(self):
         self.running = True
+        # Fixed-period schedule on the monotonic clock: sleeping
+        # UPDATE_INTERVAL *after* each cycle lets the period drift past
+        # OpenVPN's own status interval, so the collector periodically sees
+        # the same snapshot twice and then skips one — a doubled bucket
+        # followed by an empty one on the chart.
+        next_tick = time.monotonic()
         while self.running:
             try:
                 self.collect_stats()
             except Exception as e:
                 logger.error(f"Error in stats collection: {e}")
-            
-            time.sleep(UPDATE_INTERVAL)
+
+            next_tick += UPDATE_INTERVAL
+            delay = next_tick - time.monotonic()
+            if delay <= 0:
+                # Fell behind (slow cycle); resynchronise instead of
+                # running several cycles back-to-back.
+                next_tick = time.monotonic() + UPDATE_INTERVAL
+                delay = UPDATE_INTERVAL
+            time.sleep(delay)
     
     def stop(self):
         self.running = False

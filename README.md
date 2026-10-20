@@ -133,7 +133,7 @@ environment:
 | `LOG_PARSE_ENABLED` | `true` | Enable parsing of OpenVPN main log (`openvpn.log`) for auth failures / disconnect reasons / TLS metrics |
 | `LOG_PARSE_MAX_BYTES` | `10485760` | Per-cycle cap on log bytes read (sanity ceiling for huge log files after rotation) |
 | `LOG_EVENT_MATCH_WINDOW` | `180` | Seconds tolerated when associating a log event with a session row by `(server, ip, port)` |
-| `TZ` | `UTC` | Container timezone. Leave as `UTC` — all timestamps are stored and compared in UTC to match SQLite `CURRENT_TIMESTAMP`. |
+| `TZ` | `UTC` | Container timezone. Leave as `UTC` — all timestamps are stored and compared in UTC to match SQLite `CURRENT_TIMESTAMP`. The OpenVPN host may run in any timezone; its offset is detected from the status file. |
 
 ## API
 
@@ -193,15 +193,21 @@ SQLite database with the following tables:
 
 | Table | Purpose |
 |-------|---------|
-| `sessions` | One row per VPN session (start/end, bytes, addresses). Schema v3 adds nullable `disconnect_reason`, `tls_handshake_ms`, `reneg_count` filled from `openvpn.log`. |
+| `sessions` | One row per VPN session (start/end, bytes, addresses). Schema v3 adds nullable `disconnect_reason`, `tls_handshake_ms`, `reneg_count` filled from `openvpn.log`; v4 adds `last_seen` and makes `connected_since` part of the session identity. |
 | `user_stats` | Per-user aggregate counters (sessions, time, bytes). |
 | `traffic_history` | Traffic **deltas** for charts. Aggregate rows (`username IS NULL`) drive the main chart, per-user rows drive the comparison chart. |
 | `session_traffic_state` | Last-known cumulative byte counters per active session; used to compute deltas between collection cycles. Rows are upserted every cycle and removed when a session disconnects. |
 | `connection_events` | Append-only log of events parsed from `openvpn.log` (`auth_failure`, `verify_error`, `tls_error`, `peer_init`, `reneg`, `disconnect`, `inactivity`). Same retention as `traffic_history`. |
 | `log_parse_state` | Per-server byte offset / inode of the OpenVPN main log so parsing is incremental and survives restarts/rotation. |
-| `schema_version` | Single-row table tracking the applied schema version (currently `3`). |
+| `schema_version` | Single-row table tracking the applied schema version (currently `4`). |
 
-**Traffic accounting.** Traffic is stored as deltas, never as cumulative values. Very short sessions are captured via a "freshly connected" heuristic (age < 2 × `UPDATE_INTERVAL`). OpenVPN counter resets and client reconnects on the same `ip:port` are detected automatically.
+**Session identity.** A session is identified by `(user, server, ip:port, connected_since)`. A reconnect on the same `ip:port` always carries a new `connected_since`, so it becomes a new row and the old one is closed — no counter heuristics needed. The byte counters stored in `sessions` are OpenVPN's cumulative per-session values.
+
+**Traffic accounting.** Traffic charts and the day/week/month figures in the summary use deltas, never cumulative values. Very short sessions are captured via a "freshly connected" heuristic (age < 2 × `UPDATE_INTERVAL`). If the status file cannot be read reliably (missing, unreadable, or caught mid-rewrite without its `END` marker) the whole cycle is skipped: sessions and delta baselines stay as they are. Treating such a read as "no clients" would close every session, split it into two rows and double-count its cumulative bytes.
+
+**Timestamps.** OpenVPN writes every timestamp in the status file and in `openvpn.log` in the *host's local time*. The dashboard converts them to UTC using the `TIME,<local>,<epoch>` line of a `status-version 2` file (exact) or, for `status-version 1`, an offset estimated from the `Updated` line (rounded to 15 minutes). Session age, `last_seen` and disconnect times are taken from OpenVPN's own clock, so clock skew between the OpenVPN host and the container does not affect accounting.
+
+**Log tailing.** The first time a log file is seen, parsing starts at its current end; history before that point is not imported (replaying it would attach stale disconnect reasons to current sessions).
 
 ### Upgrading
 
