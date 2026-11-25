@@ -5,7 +5,7 @@
 Multi-server OpenVPN monitoring with web interface.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Python](https://img.shields.io/badge/python-3.11-blue.svg)
+![Python](https://img.shields.io/badge/python-3.14-blue.svg)
 
 ## Features
 
@@ -127,6 +127,7 @@ environment:
 | `AUTH_ENABLED` | `true` | Enable/disable authentication |
 | `AUTH_TOKEN` | (auto-generated) | Authentication token for dashboard access |
 | `UPDATE_INTERVAL` | `60` | Stats collection interval, seconds |
+| `STATUS_STALE_SECONDS` | `max(300, 5 × UPDATE_INTERVAL)` | A status file not rewritten (or not readable) for longer than this means OpenVPN is down: active sessions are closed. Keep it well above the `status <file> <seconds>` interval of the server. `0` disables the check |
 | `RETENTION_DAYS` | `90` | Session retention (days) |
 | `TRAFFIC_HISTORY_RETENTION_DAYS` | `30` | Traffic chart data retention (days) |
 | `DEFAULT_LIMIT` / `MAX_LIMIT` | `50` / `500` | User-stats pagination limits (exports ignore them) |
@@ -199,13 +200,15 @@ SQLite database with the following tables:
 | `session_traffic_state` | Last-known cumulative byte counters per active session; used to compute deltas between collection cycles. Rows are upserted every cycle and removed when a session disconnects. |
 | `connection_events` | Append-only log of events parsed from `openvpn.log` (`auth_failure`, `verify_error`, `tls_error`, `peer_init`, `reneg`, `disconnect`, `inactivity`). Same retention as `traffic_history`. |
 | `log_parse_state` | Per-server byte offset / inode of the OpenVPN main log so parsing is incremental and survives restarts/rotation. |
-| `schema_version` | Single-row table tracking the applied schema version (currently `4`). |
+| `schema_version` | Single-row table tracking the applied schema version (currently `5`). |
 
-**Session identity.** A session is identified by `(user, server, ip:port, connected_since)`. A reconnect on the same `ip:port` always carries a new `connected_since`, so it becomes a new row and the old one is closed — no counter heuristics needed. The byte counters stored in `sessions` are OpenVPN's cumulative per-session values.
+**Session identity.** A session is identified by `(user, server, ip:port, connected_since)`. A reconnect on the same `ip:port` always carries a new `connected_since`, so it becomes a new row and the old one is closed — no counter heuristics needed. The opposite case is handled too: a client that *floats* to a new `ip:port` without reconnecting (mobile network switch, NAT rebinding — OpenVPN 2.4+) keeps its `connected_since` and counters, so its row is moved to the new endpoint instead of being closed and re-inserted with the whole cumulative counters counted twice. Peers still in the TLS handshake (Common Name `UNDEF`) are not recorded. The byte counters stored in `sessions` are OpenVPN's cumulative per-session values.
 
 **Traffic accounting.** Traffic charts and the day/week/month figures in the summary use deltas, never cumulative values. Very short sessions are captured via a "freshly connected" heuristic (age < 2 × `UPDATE_INTERVAL`). If the status file cannot be read reliably (missing, unreadable, or caught mid-rewrite without its `END` marker) the whole cycle is skipped: sessions and delta baselines stay as they are. Treating such a read as "no clients" would close every session, split it into two rows and double-count its cumulative bytes.
 
-**Timestamps.** OpenVPN writes every timestamp in the status file and in `openvpn.log` in the *host's local time*. The dashboard converts them to UTC using the `TIME,<local>,<epoch>` line of a `status-version 2` file (exact) or, for `status-version 1`, an offset estimated from the `Updated` line (rounded to 15 minutes). Session age, `last_seen` and disconnect times are taken from OpenVPN's own clock, so clock skew between the OpenVPN host and the container does not affect accounting.
+**OpenVPN down.** If the status file has not been rewritten for `STATUS_STALE_SECONDS` (file mtime), or has been unreadable for that long, OpenVPN is considered stopped: active sessions are closed at the time they were last seen instead of staying "online" and accumulating connection time. If the same sessions show up again (false alarm, e.g. a status interval longer than the limit) they are reopened and the traffic baseline is restored from the stored session counters, so nothing is lost or double-counted.
+
+**Timestamps.** OpenVPN writes every timestamp in the status file and in `openvpn.log` in the *host's local time*. The dashboard converts them to UTC using the `TIME,<local>,<epoch>` line of a `status-version 2` file (exact) or, for `status-version 1`, an offset estimated from the `Updated` line and the file's modification time (rounded to 15 minutes). Session age, `last_seen` and disconnect times are taken from OpenVPN's own clock, so clock skew between the OpenVPN host and the container does not affect accounting.
 
 **Log tailing.** The first time a log file is seen, parsing starts at its current end; history before that point is not imported (replaying it would attach stale disconnect reasons to current sessions).
 

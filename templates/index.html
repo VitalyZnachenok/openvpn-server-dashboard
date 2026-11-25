@@ -7,7 +7,8 @@
     <!-- Pin exact versions of third-party libraries and use SRI where a widely
          published hash is available so a compromised CDN can't inject code. -->
     <script
-        src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
+        src="https://cdn.jsdelivr.net/npm/chart.js@4.6.2/dist/chart.umd.min.js"
+        integrity="sha384-wFIO1nJgUOP2XDesMi2Xqyej8+jLnzOfBrJbdvz7Pp+UI88xOiL08fKFupi2KqR0"
         crossorigin="anonymous"></script>
     <script
         src="https://code.jquery.com/jquery-3.7.1.min.js"
@@ -946,6 +947,25 @@
             });
         }
         
+        // Chart buckets are cut in UTC on the server. For minute/hour buckets
+        // the API also sends the bucket start instants, so print those in the
+        // viewer's local time; daily buckets keep their (UTC) date labels.
+        function chartLabels(data) {
+            if (!data.timestamps || (data.interval !== 'minute' && data.interval !== 'hour')) {
+                return data.labels;
+            }
+            return data.timestamps.map((t, i) => {
+                const d = t ? new Date(t) : null;
+                if (!d || isNaN(d)) return data.labels[i];
+                return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+            });
+        }
+
+        function formatTimestamp(ts) {
+            const d = ts ? new Date(ts) : null;
+            return d && !isNaN(d) ? d.toLocaleString() : (ts || '');
+        }
+
         // Update traffic charts
         function updateCharts() {
             const server = currentServer ? `?server=${currentServer}` : '';
@@ -957,14 +977,14 @@
             
             $.get('/api/traffic_chart' + params, function(data) {
                 if (trafficChart && data.labels && data.labels.length > 0) {
-                    trafficChart.data.labels = data.labels;
+                    trafficChart.data.labels = chartLabels(data);
                     trafficChart.data.datasets[0].data = data.inbound;
                     trafficChart.data.datasets[1].data = data.outbound;
                     trafficChart.update();
                 }
                 
                 if (usersChart && data.labels && data.labels.length > 0) {
-                    usersChart.data.labels = data.labels;
+                    usersChart.data.labels = chartLabels(data);
                     usersChart.data.datasets[0].data = data.users;
                     usersChart.update();
                 }
@@ -1324,7 +1344,7 @@
             failures.forEach(f => {
                 html += `
                     <tr>
-                        <td>${escape(f.timestamp)}</td>
+                        <td>${escape(formatTimestamp(f.timestamp))}</td>
                         <td>${escape(f.server_name)}</td>
                         <td>${typeBadge(f.event_type)}</td>
                         <td>${escape(f.username || '—')}</td>
@@ -1388,7 +1408,7 @@
                     : '';
                 html += `
                     <tr>
-                        <td>${escape(e.timestamp)}</td>
+                        <td>${escape(formatTimestamp(e.timestamp))}</td>
                         <td>${escape(e.server_name)}</td>
                         <td><span style="background:${color};color:#fff;padding:2px 6px;border-radius:4px;font-size:11px;">${escape(e.event_type)}</span></td>
                         <td>${escape(e.username || '—')}</td>
@@ -1578,7 +1598,7 @@
                 
                 // Update chart
                 if (comparisonChart) {
-                    comparisonChart.data.labels = data.labels;
+                    comparisonChart.data.labels = chartLabels(data);
                     comparisonChart.data.datasets = datasets;
                     comparisonChart.update();
                 }

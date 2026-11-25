@@ -12,6 +12,10 @@ services:
       FLASK_ENV: production
       DB_PATH: /app/data/openvpn_stats.db
       UPDATE_INTERVAL: "60"
+      # Если статус-файл не обновлялся дольше этого времени (сек), OpenVPN считается
+      # остановленным и активные сессии закрываются. Должно быть заметно больше
+      # интервала `status <file> <сек>` в конфиге OpenVPN. 0 — отключить проверку.
+      # STATUS_STALE_SECONDS: "300"
       # Серверы: NAME:STATUS_FILE[:LOG_FILE], несколько серверов — через ";".
       # STATUS_FILE — `status` файл OpenVPN (status-version 2).
       # LOG_FILE — основной openvpn.log (log / log-append). Опционально, но

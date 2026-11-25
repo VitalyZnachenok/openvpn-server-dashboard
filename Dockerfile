@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 # curl is needed for the HEALTHCHECK; keep the image slim and skip the
 # compiler since all Python dependencies are wheels on linux/amd64 and
@@ -30,6 +30,8 @@ EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:5000/api/health || exit 1
 
+# The control socket (gunicorn 25+) is a local management interface this
+# image has no use for.
 # Single worker + threads: SQLite doesn't support multi-process writes,
 # and the background collector must run in exactly one process.
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "4", "--timeout", "120", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "4", "--timeout", "120", "--no-control-socket", "app:app"]

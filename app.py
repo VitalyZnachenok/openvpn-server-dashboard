@@ -49,7 +49,7 @@ def iso_utc(ts: Optional[str]) -> Optional[str]:
 
 # Schema version managed via a dedicated `schema_version` table.
 # Bump when the schema changes and add a migration step in DatabaseManager._migrate.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Timestamp format used for SQLite TIMESTAMP columns written from Python.
 TS_FMT = '%Y-%m-%d %H:%M:%S'
@@ -76,6 +76,19 @@ def _format_chart_labels(time_slots: List[str], interval_name: str) -> List[str]
             labels.append(ts)
     return labels
 
+
+def _bucket_timestamps(time_slots: List[str], interval_name: str) -> List[Optional[str]]:
+    """Bucket start instants as explicit-UTC ISO strings.
+
+    Buckets are cut in UTC; for minute/hour buckets the frontend uses these
+    to print labels in the viewer's local time (the plain `labels` are UTC).
+    Daily buckets are UTC days and have no meaningful local instant.
+    """
+    if interval_name not in ('hour', 'minute'):
+        return [None for ts in time_slots if ts]
+    return [ts.replace(' ', 'T', 1) + ':00Z' for ts in time_slots if ts]
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -95,6 +108,17 @@ DB_PATH = os.getenv("DB_PATH", "/app/data/openvpn_stats.db")
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "60"))
 FLASK_PORT = int(os.getenv("FLASK_PORT", "5000"))
 FLASK_HOST = os.getenv("FLASK_HOST", "0.0.0.0")
+
+# A status file that OpenVPN has not rewritten for this many seconds (or that
+# could not be read for this long) is treated as "OpenVPN is down": active
+# sessions are closed at the time they were last seen instead of staying
+# "online" forever and inflating connection time. Must be comfortably larger
+# than the `status <file> <seconds>` interval of the OpenVPN server.
+# 0 disables the check.
+STATUS_STALE_SECONDS = int(os.getenv("STATUS_STALE_SECONDS", str(max(300, UPDATE_INTERVAL * 5))))
+
+# Common Name OpenVPN reports for a peer that has not finished authenticating.
+UNDEF_CN = 'UNDEF'
 
 # Data retention configuration
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "90"))  # Keep data for 90 days
@@ -168,6 +192,12 @@ LOG_EVENT_MATCH_WINDOW = int(os.getenv("LOG_EVENT_MATCH_WINDOW", "180"))
 # CORS configuration
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "")
 
+def _token_matches(token: str) -> bool:
+    """Constant-time token check. Compared as bytes: compare_digest raises
+    TypeError on non-ASCII str, which would turn a bad token into a 500."""
+    return hmac.compare_digest(token.encode('utf-8'), AUTH_TOKEN.encode('utf-8'))
+
+
 # Authentication decorator
 def require_auth(f):
     """Decorator to require authentication for API endpoints"""
@@ -183,7 +213,7 @@ def require_auth(f):
         if not token:
             token = request.args.get('token', '').strip()
         
-        if not token or not hmac.compare_digest(token, AUTH_TOKEN):
+        if not token or not _token_matches(token):
             return jsonify({'error': 'Unauthorized', 'message': 'Invalid or missing authentication token'}), 401
         
         return f(*args, **kwargs)
@@ -472,6 +502,19 @@ class DatabaseManager:
             ''')
             logger.info(f"Migration v4: rebuilt {rebuilt} session_traffic_state rows with v4 keys")
 
+        if from_version < 5:
+            # v5: peers that have not finished the TLS handshake show up in
+            # the status file under the placeholder CN "UNDEF". Older
+            # versions recorded them as a user; drop that junk.
+            purged = 0
+            for table in ('sessions', 'user_stats', 'traffic_history', 'session_traffic_state'):
+                purged += conn.execute(
+                    f'DELETE FROM {table} WHERE username = ?', (UNDEF_CN,)
+                ).rowcount
+            if purged:
+                logger.info(f"Migration v5: removed {purged} rows recorded for the "
+                            f"'{UNDEF_CN}' placeholder user")
+
         # Unique identity of an active session. Created here (not in
         # init_db) so it comes after the v4 migration dropped the old index.
         conn.execute('''
@@ -627,6 +670,76 @@ class DatabaseManager:
                     seen,
                 ))
 
+    def adopt_floated_sessions(self, server_name: str, sessions: List[VPNSession],
+                               conn: Optional[sqlite3.Connection] = None) -> int:
+        """Follow sessions whose real address changed mid-session.
+
+        Since OpenVPN 2.4 a client may "float" to a new ip:port (mobile
+        network switch, NAT rebinding) without reconnecting: the status
+        file then shows the same Connected Since and ever-growing counters
+        under a new Real Address. Without this step the old row would be
+        closed and a new one inserted carrying the *whole* cumulative
+        counters again — the user's bytes and connection time would be
+        counted twice.
+
+        A float is recognised when exactly one active row vanished and
+        exactly one new session appeared for the same (user,
+        connected_since), with counters that did not go backwards. The row
+        and its traffic baseline are moved to the new endpoint. Returns the
+        number of sessions moved.
+        """
+        moved = 0
+        with self._tx(conn) as conn:
+            rows = conn.execute('''
+                SELECT id, username, real_address, real_address_port, connected_since,
+                       bytes_received, bytes_sent
+                FROM sessions
+                WHERE server_name = ? AND disconnected_at IS NULL
+            ''', (server_name,)).fetchall()
+            if not rows:
+                return 0
+
+            live = {(s.username, s.real_address, s.real_address_port, ts_str(s.connected_since))
+                    for s in sessions}
+            known = {(r[1], r[2], r[3], r[4]) for r in rows}
+
+            vanished: Dict[Tuple[str, str], list] = {}
+            for r in rows:
+                if (r[1], r[2], r[3], r[4]) not in live:
+                    vanished.setdefault((r[1], r[4]), []).append(r)
+            if not vanished:
+                return 0
+
+            appeared: Dict[Tuple[str, str], List[VPNSession]] = {}
+            for s in sessions:
+                cs = ts_str(s.connected_since)
+                if (s.username, s.real_address, s.real_address_port, cs) not in known:
+                    appeared.setdefault((s.username, cs), []).append(s)
+
+            for key, new_sessions in appeared.items():
+                old_rows = vanished.get(key)
+                if not old_rows or len(old_rows) != 1 or len(new_sessions) != 1:
+                    continue  # nothing to pair with, or ambiguous
+                old_id, username, old_ip, old_port, cs, old_in, old_out = old_rows[0]
+                s = new_sessions[0]
+                if s.bytes_received < old_in or s.bytes_sent < old_out:
+                    continue
+                conn.execute(
+                    'UPDATE sessions SET real_address = ?, real_address_port = ? WHERE id = ?',
+                    (s.real_address, s.real_address_port, old_id),
+                )
+                conn.execute(
+                    'UPDATE OR REPLACE session_traffic_state SET session_key = ? WHERE session_key = ?',
+                    (self._session_key(server_name, username, s.real_address, s.real_address_port, cs),
+                     self._session_key(server_name, username, old_ip, old_port, cs)),
+                )
+                moved += 1
+                logger.info(
+                    f"[{server_name}] {username} floated {old_ip}:{old_port} -> "
+                    f"{s.real_address}:{s.real_address_port} — session id={old_id} kept"
+                )
+        return moved
+
     def close_session(self, session_id: int, closed_at: datetime,
                       conn: Optional[sqlite3.Connection] = None):
         """Mark a session row as disconnected at `closed_at` (naive UTC)."""
@@ -688,7 +801,14 @@ class DatabaseManager:
 
             per_user_delta: Dict[str, Tuple[int, int]] = {}
             state_upserts: List[Tuple[str, str, str, int, int]] = []
-            current_keys = set()
+            # Every key present in this snapshot, known up front so the
+            # upgrade-path lookup below never adopts the state row of
+            # another session that is still alive.
+            current_keys = {
+                self._session_key(server_name, s.username, s.real_address,
+                                  s.real_address_port, s.connected_since)
+                for s in sessions
+            }
 
             # `now` is the OpenVPN snapshot time when the caller has it, so
             # session age is measured on the same clock as connected_since.
@@ -700,7 +820,6 @@ class DatabaseManager:
                     server_name, session.username, session.real_address,
                     session.real_address_port, session.connected_since,
                 )
-                current_keys.add(key)
                 prev = prev_state.get(key)
 
                 if prev is None:
@@ -725,6 +844,24 @@ class DatabaseManager:
                             current_keys.add(old_key)  # keep it from being deleted as stale...
                             prev_state.pop(old_key, None)  # ...but do not match it twice
                             break
+
+                if prev is None:
+                    # No state row, but the session itself is already on
+                    # record (state pruned during a long status-file outage,
+                    # or a row closed as stale that is about to be
+                    # reopened): its stored counters are the last values we
+                    # accounted for, so they are the baseline.
+                    row = conn.execute('''
+                        SELECT bytes_received, bytes_sent FROM sessions
+                        WHERE username = ? AND server_name = ? AND real_address = ?
+                          AND real_address_port = ? AND connected_since = ?
+                          AND bytes_received <= ? AND bytes_sent <= ?
+                        ORDER BY id DESC LIMIT 1
+                    ''', (session.username, server_name, session.real_address,
+                          session.real_address_port, ts_str(session.connected_since),
+                          session.bytes_received, session.bytes_sent)).fetchone()
+                    if row is not None:
+                        prev = (row[0], row[1])
 
                 if prev is not None:
                     prev_in, prev_out = prev
@@ -961,7 +1098,7 @@ class DatabaseManager:
     def get_traffic_history(self, hours: float = 24, server_name: Optional[str] = None) -> Dict:
         """Aggregate delta traffic for the main chart (all users combined)."""
         with self._tx() as conn:
-            since = utcnow() - timedelta(hours=hours)
+            since = ts_str(utcnow() - timedelta(hours=hours))
 
             if hours <= 6:
                 interval_format = '%Y-%m-%d %H:%M'
@@ -1018,6 +1155,8 @@ class DatabaseManager:
 
             return {
                 'labels': labels,
+                'timestamps': _bucket_timestamps([row[0] for row in valid_rows], interval_name),
+                'interval': interval_name,
                 'inbound': [row[1] / (1024 ** 3) if row[1] else 0 for row in valid_rows],
                 'outbound': [row[2] / (1024 ** 3) if row[2] else 0 for row in valid_rows],
                 'users': [int(row[3]) if row[3] else 0 for row in valid_rows],
@@ -1033,7 +1172,7 @@ class DatabaseManager:
         previous 2-hour per-session cleanup).
         """
         with self._tx() as conn:
-            since = utcnow() - timedelta(hours=hours)
+            since = ts_str(utcnow() - timedelta(hours=hours))
 
             if hours <= 6:
                 interval_format = '%Y-%m-%d %H:%M'
@@ -1101,6 +1240,7 @@ class DatabaseManager:
 
             return {
                 'labels': labels,
+                'timestamps': _bucket_timestamps(time_slots, interval_name),
                 'datasets': datasets,
                 'interval': interval_name,
             }
@@ -1197,8 +1337,8 @@ class DatabaseManager:
         """
         try:
             with self._tx() as conn:
-                sessions_cutoff = utcnow() - timedelta(days=RETENTION_DAYS)
-                traffic_cutoff = utcnow() - timedelta(days=TRAFFIC_HISTORY_RETENTION_DAYS)
+                sessions_cutoff = ts_str(utcnow() - timedelta(days=RETENTION_DAYS))
+                traffic_cutoff = ts_str(utcnow() - timedelta(days=TRAFFIC_HISTORY_RETENTION_DAYS))
 
                 sessions_deleted = conn.execute('''
                     DELETE FROM sessions
@@ -1221,7 +1361,7 @@ class DatabaseManager:
                 # Orphan state rows: stale for more than a few update cycles.
                 # Normally cleaned inline by save_traffic_snapshot, but this
                 # is a safety net when the collector missed or crashed cycles.
-                stale_state_cutoff = utcnow() - timedelta(seconds=max(600, UPDATE_INTERVAL * 10))
+                stale_state_cutoff = ts_str(utcnow() - timedelta(seconds=max(600, UPDATE_INTERVAL * 10)))
                 state_deleted = conn.execute('''
                     DELETE FROM session_traffic_state
                     WHERE updated_at < ?
@@ -1355,7 +1495,7 @@ class DatabaseManager:
                     ev.real_address_port,
                     ev.reason_text,
                     ev.raw_line,
-                    ev.timestamp,
+                    ts_str(ev.timestamp),
                 )
                 for ev in events
             ]
@@ -1443,7 +1583,7 @@ class DatabaseManager:
     def get_auth_failures(self, server_name: Optional[str] = None,
                           hours: int = 24, limit: int = 200) -> List[Dict]:
         """Return recent auth/verify/TLS failures, newest first."""
-        since = utcnow() - timedelta(hours=hours)
+        since = ts_str(utcnow() - timedelta(hours=hours))
         params: list = ['auth_failure', 'verify_error', 'tls_error', since]
         server_filter = ''
         if server_name:
@@ -1468,7 +1608,7 @@ class DatabaseManager:
     def get_auth_failure_summary(self, server_name: Optional[str] = None,
                                   hours: int = 24) -> Dict:
         """Aggregate counters used by the dashboard summary card."""
-        since = utcnow() - timedelta(hours=hours)
+        since = ts_str(utcnow() - timedelta(hours=hours))
         params: list = ['auth_failure', 'verify_error', 'tls_error', since]
         server_filter = ''
         if server_name:
@@ -1637,6 +1777,11 @@ class OpenVPNParser:
         # UTC time at which OpenVPN wrote the last parsed snapshot.
         self.snapshot_time: Optional[datetime] = None
         self._offset_logged: Optional[timedelta] = None
+        # Modification time of the status file at the last read (naive UTC)
+        # and its age in seconds. OpenVPN rewrites the file every status
+        # interval, so a growing age means OpenVPN is not running.
+        self.file_mtime: Optional[datetime] = None
+        self.file_age: Optional[float] = None
 
     def parse_status_file(self) -> Optional[List[VPNSession]]:
         """Return the sessions in the status file, or None when it could not
@@ -1648,16 +1793,20 @@ class OpenVPNParser:
         clients" would close every session, split each one into two rows
         and double-count their cumulative byte counters.
         """
-        if not os.path.exists(self.status_file):
+        self.file_mtime = None
+        self.file_age = None
+        try:
+            with open(self.status_file, 'r', errors='replace') as f:
+                mtime = os.fstat(f.fileno()).st_mtime
+                lines = f.readlines()
+        except FileNotFoundError:
             logger.warning(f"[{self.server_name}] Status file not found: {self.status_file}")
             return None
-
-        try:
-            with open(self.status_file, 'r') as f:
-                lines = f.readlines()
-        except IOError as e:
+        except OSError as e:
             logger.error(f"[{self.server_name}] I/O error reading status file: {e}")
             return None
+        self.file_mtime = datetime.fromtimestamp(mtime, tz=timezone.utc).replace(tzinfo=None)
+        self.file_age = time.time() - mtime
 
         version = self._detect_version(lines)
         if version != self._format_logged:
@@ -1693,7 +1842,7 @@ class OpenVPNParser:
             logger.info(
                 f"[{self.server_name}] OpenVPN host clock offset from UTC: "
                 f"{self.tz_offset.total_seconds() / 3600:+.2f} h "
-                f"({'exact, from TIME epoch' if version == 2 else 'estimated from Updated line'})"
+                f"({'exact, from TIME epoch' if version == 2 else 'estimated from Updated line and file mtime'})"
             )
             self._offset_logged = self.tz_offset
 
@@ -1779,6 +1928,9 @@ class OpenVPNParser:
                         continue
 
                     username = parts[1]
+                    if username == UNDEF_CN:
+                        # Peer still in the TLS handshake — not a user yet.
+                        continue
                     ip, port = self._split_endpoint(parts[2])
                     virtual_address = parts[3] or None
                     bytes_received = int(parts[5]) if parts[5].isdigit() else 0
@@ -1873,13 +2025,15 @@ class OpenVPNParser:
 
             if section == 'clients':
                 if line.startswith('Updated,'):
-                    # v1 has no epoch, so the host's UTC offset is estimated:
-                    # the snapshot is at most one status interval old and we
-                    # read it within one collector cycle, so rounding the
-                    # difference to 15 minutes recovers the zone offset.
+                    # v1 has no epoch, so the host's UTC offset is estimated
+                    # from the file's modification time: OpenVPN stamps
+                    # "Updated" and writes the file in the same instant, so
+                    # rounding the difference to 15 minutes recovers the
+                    # zone offset — also for a stale file, where comparing
+                    # with the current time would drift by 15-minute steps.
                     updated = self._parse_dt(line.split(',', 1)[1])
                     if updated is not None:
-                        diff = (updated - utcnow()).total_seconds()
+                        diff = (updated - (self.file_mtime or utcnow())).total_seconds()
                         quarter = 15 * 60
                         self.tz_offset = timedelta(seconds=round(diff / quarter) * quarter)
                         self.snapshot_time = updated - self.tz_offset
@@ -1893,6 +2047,8 @@ class OpenVPNParser:
                 parts = line.split(',')
                 try:
                     cn = parts[cols['common name']]
+                    if cn == UNDEF_CN:
+                        continue
                     endpoint = parts[cols['real address']]
                     ip, port = self._split_endpoint(endpoint)
                     bytes_received = int(parts[cols['bytes received']])
@@ -2312,6 +2468,11 @@ class MultiServerStatsCollector:
                 'name': server['name'],
                 'parser': OpenVPNParser(server['status_file'], server['name']),
                 'log_parser': log_parser,
+                # Monotonic time of the last usable status snapshot and
+                # whether the "OpenVPN looks down" warning was already
+                # logged (once per outage, not once per cycle).
+                'last_ok': time.monotonic(),
+                'stale_logged': False,
             })
         self.running = False
         self.cleanup_counter = 0  # cycles since last cleanup
@@ -2330,12 +2491,40 @@ class MultiServerStatsCollector:
 
             try:
                 sessions = parser.parse_status_file()
+                stale_reason = None
                 if sessions is None:
-                    # Unreadable / half-written status file: keep every
-                    # session and every traffic baseline exactly as it is
-                    # and try again next cycle.
-                    logger.warning(f"[{server_name}] Skipping cycle: status file unavailable")
-                    continue
+                    unavailable_for = time.monotonic() - parser_info['last_ok']
+                    if STATUS_STALE_SECONDS <= 0 or unavailable_for <= STATUS_STALE_SECONDS:
+                        # Unreadable / half-written status file: keep every
+                        # session and every traffic baseline exactly as it
+                        # is and try again next cycle.
+                        logger.warning(f"[{server_name}] Skipping cycle: status file unavailable")
+                        continue
+                    stale_reason = f"status file unavailable for {int(unavailable_for)}s"
+                else:
+                    parser_info['last_ok'] = time.monotonic()
+                    if (STATUS_STALE_SECONDS > 0 and parser.file_age is not None
+                            and parser.file_age > STATUS_STALE_SECONDS):
+                        stale_reason = f"status file not rewritten for {int(parser.file_age)}s"
+
+                if stale_reason:
+                    # OpenVPN is not maintaining the file, so nobody is
+                    # connected as far as we can tell. Sessions are closed
+                    # at the time they were last seen; if the very same
+                    # sessions come back, save_session reopens them and the
+                    # traffic baseline is restored from the session rows, so
+                    # a false alarm costs nothing.
+                    if not parser_info['stale_logged']:
+                        logger.warning(
+                            f"[{server_name}] OpenVPN looks down ({stale_reason}, "
+                            f"limit {STATUS_STALE_SECONDS}s) — closing active sessions"
+                        )
+                        parser_info['stale_logged'] = True
+                    sessions = []
+                elif parser_info['stale_logged']:
+                    logger.info(f"[{server_name}] Status file is being updated again")
+                    parser_info['stale_logged'] = False
+
                 if log_parser is not None:
                     log_parser.tz_offset = parser.tz_offset
 
@@ -2352,6 +2541,10 @@ class MultiServerStatsCollector:
                 # One connection and one transaction per server per cycle,
                 # instead of two connections + commits per session.
                 with self.db._tx() as conn:
+                    # Must run first: it rewrites the endpoint of rows whose
+                    # client changed ip:port, so everything below sees them
+                    # as the same session.
+                    self.db.adopt_floated_sessions(server_name, sessions, conn=conn)
                     db_active_sessions = self.db.get_active_sessions(server_name, conn=conn)
 
                     current_session_keys = {
@@ -2502,10 +2695,12 @@ def api_login():
     if not AUTH_ENABLED:
         return jsonify({'success': True, 'message': 'Authentication disabled'})
     
-    data = request.get_json() or {}
-    token = data.get('token', '').strip()
-    
-    if hmac.compare_digest(token, AUTH_TOKEN):
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    token = str(data.get('token') or '').strip()
+
+    if _token_matches(token):
         return jsonify({'success': True, 'message': 'Authentication successful'})
     else:
         return jsonify({'success': False, 'message': 'Invalid token'}), 401
@@ -2619,12 +2814,21 @@ def api_user_stats():
         logger.error(f"Error fetching user stats: {e}")
         return jsonify({'error': str(e)}), 500
 
+def _hours_arg(default: float = 24) -> float:
+    """`hours` query parameter as a sane positive number (fractions allowed,
+    e.g. 0.083 for 5 minutes). NaN/inf/negative fall back to the default."""
+    hours = request.args.get('hours', default, type=float)
+    if hours is None or hours != hours or hours <= 0:
+        return default
+    return min(hours, 24 * 366)
+
+
 @app.route('/api/traffic_chart')
 @require_auth
 def api_traffic_chart():
     """Get traffic chart data"""
     server = request.args.get('server')
-    hours = request.args.get('hours', 24, type=float)  # Changed to float to support 0.083 (5 min)
+    hours = _hours_arg()
     
     data = db.get_traffic_history(hours, server)
     return jsonify(data)
@@ -2640,7 +2844,7 @@ def api_user_traffic_chart():
         server: optional server filter
     """
     users_param = request.args.get('users', '')
-    hours = request.args.get('hours', 24, type=float)
+    hours = _hours_arg()
     server = request.args.get('server')
 
     if not users_param:
@@ -2763,8 +2967,11 @@ def api_auth_failures():
     server = request.args.get('server')
     hours = max(1, min(request.args.get('hours', 24, type=int), 24 * 30))
     limit = max(1, min(request.args.get('limit', 200, type=int), 1000))
+    failures = db.get_auth_failures(server, hours, limit)
+    for f in failures:
+        f['timestamp'] = iso_utc(f['timestamp'])
     return jsonify({
-        'failures': db.get_auth_failures(server, hours, limit),
+        'failures': failures,
         'summary': db.get_auth_failure_summary(server, hours),
     })
 
@@ -2777,9 +2984,10 @@ def api_recent_events():
     types_param = request.args.get('types', '')
     types = [t.strip() for t in types_param.split(',') if t.strip()] or None
     limit = max(1, min(request.args.get('limit', 100, type=int), 1000))
-    return jsonify({
-        'events': db.get_recent_events(server, types, limit),
-    })
+    events = db.get_recent_events(server, types, limit)
+    for e in events:
+        e['timestamp'] = iso_utc(e['timestamp'])
+    return jsonify({'events': events})
 
 
 @app.route('/api/export/sessions')
