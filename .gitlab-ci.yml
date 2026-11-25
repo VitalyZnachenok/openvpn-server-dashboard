@@ -15,9 +15,12 @@
 #   push to the default branch → :latest and :<short sha>
 #   git tag vX.Y.Z             → :X.Y.Z (the tag without the leading "v")
 #   merge request              → build only, nothing is pushed
+# Every image is multi-arch: linux/amd64 and linux/arm64 (see PLATFORMS).
 #
 # The runner's docker executor must either run with `privileged = true`
-# (docker-in-docker) or mount the host's /var/run/docker.sock.
+# (docker-in-docker) or mount the host's /var/run/docker.sock. The foreign
+# architecture is built under QEMU emulation, which is registered through a
+# privileged helper container.
 
 stages:
   - build
@@ -39,6 +42,7 @@ workflow:
     # connection never leaves the job's private network.
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
+    PLATFORMS: linux/amd64,linux/arm64
   before_script:
     # A runner that mounts the host's /var/run/docker.sock needs no dind.
     - if [ -S /var/run/docker.sock ]; then unset DOCKER_HOST; fi
@@ -53,6 +57,16 @@ workflow:
         fi
         sleep 1
       done
+    # QEMU handlers for the non-native architecture, then a BuildKit builder
+    # (the default docker driver cannot produce multi-platform images).
+    - docker run --privileged --rm tonistiigi/binfmt --install arm64,amd64
+    - docker buildx create --name "ci-$CI_JOB_ID" --driver docker-container --use
+    - docker buildx inspect --bootstrap
+  after_script:
+    # Matters only with a mounted host socket, where the builder container
+    # would otherwise outlive the job.
+    - if [ -S /var/run/docker.sock ]; then unset DOCKER_HOST; fi
+    - docker buildx rm "ci-$CI_JOB_ID" || true
 
 # Merge requests: prove the image still builds.
 build:
@@ -60,7 +74,7 @@ build:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   script:
-    - docker build --pull -t "$CI_PROJECT_NAME:$CI_COMMIT_SHORT_SHA" .
+    - docker buildx build --pull --platform "$PLATFORMS" .
 
 # Default branch and tags: build and push.
 publish:
@@ -86,14 +100,16 @@ publish:
       fi
     - TAG_ARGS=""
     - for t in $TAGS; do TAG_ARGS="$TAG_ARGS -t $IMAGE:$t"; done
-    # Reuse layers of the previously published image when it exists.
-    - docker pull "$IMAGE:latest" || true
+    # One multi-arch manifest per tag, pushed straight from the builder.
+    # Layers are reused from a cache kept in the registry next to the image.
     - >
-      docker build --pull
-      --cache-from "$IMAGE:latest"
-      --build-arg BUILDKIT_INLINE_CACHE=1
+      docker buildx build --pull --push
+      --platform "$PLATFORMS"
+      --cache-from "type=registry,ref=$IMAGE:buildcache"
+      --cache-to "type=registry,ref=$IMAGE:buildcache,mode=max"
       --label "org.opencontainers.image.revision=$CI_COMMIT_SHA"
       $TAG_ARGS .
-    - for t in $TAGS; do docker push "$IMAGE:$t"; done
+    - for t in $TAGS; do docker buildx imagetools inspect "$IMAGE:$t"; done
   after_script:
+    - !reference [.docker, after_script]
     - docker logout || true
