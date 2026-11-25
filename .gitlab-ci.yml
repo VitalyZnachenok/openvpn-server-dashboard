@@ -16,8 +16,8 @@
 #   git tag vX.Y.Z             → :X.Y.Z (the tag without the leading "v")
 #   merge request              → build only, nothing is pushed
 #
-# The runner's docker executor must run with `privileged = true`
-# (docker-in-docker).
+# The runner's docker executor must either run with `privileged = true`
+# (docker-in-docker) or mount the host's /var/run/docker.sock.
 
 stages:
   - build
@@ -34,10 +34,25 @@ workflow:
   services:
     - docker:29-dind
   variables:
-    DOCKER_HOST: tcp://docker:2376
-    DOCKER_TLS_CERTDIR: "/certs"
-    DOCKER_TLS_VERIFY: "1"
-    DOCKER_CERT_PATH: "/certs/client"
+    # Plain TCP to the dind service: TLS would need the runner to share a
+    # /certs/client volume between the job and the service container. The
+    # connection never leaves the job's private network.
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    # A runner that mounts the host's /var/run/docker.sock needs no dind.
+    - if [ -S /var/run/docker.sock ]; then unset DOCKER_HOST; fi
+    - |
+      i=0
+      until docker info >/dev/null 2>&1; do
+        i=$((i + 1))
+        if [ "$i" -ge 60 ]; then
+          echo "Docker daemon is not reachable. The runner needs privileged = true (docker-in-docker) or a mounted /var/run/docker.sock." >&2
+          docker info || true
+          exit 1
+        fi
+        sleep 1
+      done
 
 # Merge requests: prove the image still builds.
 build:
@@ -54,6 +69,7 @@ publish:
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   before_script:
+    - !reference [.docker, before_script]
     - |
       if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
         echo "DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are not set (or are protected and this ref is not)." >&2
