@@ -221,7 +221,9 @@ The daily cleanup job also prunes orphaned `user_stats`, recomputes aggregates a
 ## Makefile
 
 ```bash
-make up         # Start
+make up         # Start (pulls kernel24/openvpn-server-dashboard on first run)
+make update     # Pull the latest published image and restart on it
+make build      # Build the image locally instead of pulling
 make down       # Stop
 make restart    # Restart
 make logs       # Follow logs

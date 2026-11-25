@@ -1,9 +1,11 @@
-.PHONY: help build up down restart logs clean shell tail-logs
+.PHONY: help build pull update up down restart logs clean shell tail-logs
 
 help:
 	@echo "OpenVPN Statistics Docker Management"
 	@echo "===================================="
-	@echo "make build     - Build Docker images"
+	@echo "make pull      - Pull the published image from Docker Hub"
+	@echo "make update    - Pull the published image and restart on it"
+	@echo "make build     - Build the image locally instead of pulling"
 	@echo "make up        - Start services"
 	@echo "make down      - Stop services"
 	@echo "make restart   - Restart services"
@@ -14,6 +16,12 @@ help:
 
 build:
 	docker compose build --no-cache
+
+pull:
+	docker compose pull
+
+update: pull
+	docker compose up -d
 
 up:
 	docker compose up -d

@@ -223,7 +223,9 @@ SQLite со следующими таблицами:
 ## Makefile
 
 ```bash
-make up         # Запуск
+make up         # Запуск (при первом запуске скачивает kernel24/openvpn-server-dashboard)
+make update     # Скачать свежий образ и перезапуститься на нём
+make build      # Собрать образ локально вместо скачивания
 make down       # Остановка
 make restart    # Перезапуск
 make logs       # Просмотр логов

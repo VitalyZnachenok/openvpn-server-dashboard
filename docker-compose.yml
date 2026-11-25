@@ -1,5 +1,8 @@
 services:
   openvpn-stats:
+    # Готовый образ с Docker Hub (публикуется из GitLab CI). `make update`
+    # подтягивает свежий; `make build` собирает локально под тем же именем.
+    image: kernel24/openvpn-server-dashboard:latest
     build: .
     container_name: openvpn-stats
     restart: unless-stopped
